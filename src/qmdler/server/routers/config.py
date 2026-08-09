@@ -13,6 +13,7 @@ from ...core.models import (
     DEFAULT_QUALITY_CHAIN,
     QUALITY_TABLE,
     SongEntry,
+    quality_caveat,
     quality_extension,
     quality_label,
 )
@@ -146,6 +147,7 @@ async def qualities() -> dict[str, Any]:
                 "code": code,
                 "label": label,
                 "extension": quality_extension(code),
+                "caveat": quality_caveat(code),
             }
             for code, (label, _) in QUALITY_TABLE.items()
         ],

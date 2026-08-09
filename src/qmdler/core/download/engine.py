@@ -469,13 +469,17 @@ class DownloadEngine:
                 self._diagnosis.extracted_prefix = prefix_result.actual_prefix or verify.extract_prefix(
                     candidate.purl,
                 ) or verify.extract_prefix(candidate.filename)
+                prefix_ran = verify.prefix_applicable(quality, candidate.purl, candidate.filename)
                 self._diagnosis.add(
                     LayerResult(
                         name="第1层 filename 前缀",
-                        observed=f"{self._diagnosis.extracted_prefix}（取自 {self._diagnosis.prefix_source}）",
-                        expected=quality_start_code(quality),
-                        verdict=prefix_result.verdict.value,
-                        detail=prefix_result.detail,
+                        observed=(
+                            f"{self._diagnosis.extracted_prefix}（取自 {self._diagnosis.prefix_source}）"
+                            if prefix_ran else "purl 与 filename 里都抠不出四字符前缀"
+                        ),
+                        expected=quality_start_code(quality) or "（该档位没有已知编码）",
+                        verdict=prefix_result.verdict.value if prefix_ran else verify.LAYER_SKIPPED,
+                        detail=prefix_result.detail or ("" if prefix_ran else "本层未执行"),
                     ),
                 )
             if prefix_result.verdict is verify.Verdict.TRIAL and self._settings.quality.reject_trial:
@@ -614,20 +618,30 @@ class DownloadEngine:
                 LayerResult(
                     name="第2层 试听片段绝对大小基准（size_try）",
                     observed=f"探到 {content_length} 字节",
-                    expected=f"≠ size_try={entry.size_try}（试听片段的绝对大小基准，"
-                    f"不是本曲正片的特征值；落在其 ±"
-                    f"{settings.quality.size_tolerance:.0%} 内即判 trial）",
-                    verdict=pre_checks[1].verdict.value,
-                    detail=pre_checks[1].detail,
+                    expected=(
+                        f"≠ size_try={entry.size_try}（试听片段的绝对大小基准，"
+                        f"不是本曲正片的特征值；落在其 ±"
+                        f"{settings.quality.size_tolerance:.0%} 内即判 trial）"
+                        if entry.size_try > 0 else "该曲目没有 size_try，无基准可比"
+                    ),
+                    verdict=(
+                        pre_checks[1].verdict.value
+                        if verify.trial_size_applicable(entry, content_length)
+                        else verify.LAYER_SKIPPED
+                    ),
+                    detail=pre_checks[1].detail or (
+                        "" if verify.trial_size_applicable(entry, content_length) else "本层未执行"
+                    ),
                 ),
             )
+            size_ran = verify.size_applicable(expected_size, content_length)
             self._diagnosis.add(
                 LayerResult(
                     name="第3层 Content-Length vs size_*（下载前）",
                     observed=f"{content_length} 字节（{probe_result.method} 分支，HTTP {probe_result.status_code}）",
-                    expected=f"{expected_size} 字节",
-                    verdict=pre_checks[2].verdict.value,
-                    detail=pre_checks[2].detail or delta_note,
+                    expected=f"{expected_size} 字节" if expected_size > 0 else "该档位没有声明大小",
+                    verdict=pre_checks[2].verdict.value if size_ran else verify.LAYER_SKIPPED,
+                    detail=(pre_checks[2].detail or delta_note) if size_ran else "本层未执行",
                 ),
             )
         if pre_result.verdict is verify.Verdict.TRIAL and settings.quality.reject_trial:
@@ -737,19 +751,37 @@ class DownloadEngine:
             duration = actual_duration
             self._diagnosis.downloaded_bytes = outcome.bytes_written
             self._diagnosis.actual_duration = round(duration, 2)
+            post_size_ran = verify.size_applicable(expected_size, outcome.bytes_written)
             self._diagnosis.add(
                 LayerResult(
                     name="第3层 实际字节数 vs size_*（落盘后）",
                     observed=f"{outcome.bytes_written} 字节",
-                    expected=f"{expected_size} 字节",
-                    verdict=verify.check_size(
-                        expected_size, outcome.bytes_written, tolerance=settings.quality.size_tolerance,
-                    ).verdict.value,
+                    expected=f"{expected_size} 字节" if expected_size > 0 else "该档位没有声明大小",
+                    verdict=(
+                        verify.check_size(
+                            expected_size, outcome.bytes_written,
+                            tolerance=settings.quality.size_tolerance,
+                        ).verdict.value
+                        if post_size_ran else verify.LAYER_SKIPPED
+                    ),
+                    detail="" if post_size_ran else "本层未执行",
                 ),
             )
             duration_check = verify.check_duration(
                 entry, duration, tolerance=settings.quality.duration_tolerance,
             )
+            duration_ran = verify.duration_applicable(entry, duration)
+            if duration_ran:
+                duration_verdict = duration_check.verdict.value
+                duration_note = duration_check.detail
+            elif entry.interval <= 0:
+                # 连基准都没有, 无从比起 —— 正常情况, 不用担心.
+                duration_verdict = verify.LAYER_SKIPPED
+                duration_note = "本层未执行：该曲目没有 interval"
+            else:
+                # 基准有、数据拿不到 —— 这首歌确实少了一层校验, 要担心.
+                duration_verdict = verify.LAYER_UNVERIFIED
+                duration_note = "本层未能执行，试听检测只剩前三层"
             self._diagnosis.add(
                 LayerResult(
                     name="第4层 实际时长 vs interval",
@@ -757,12 +789,37 @@ class DownloadEngine:
                         f"{duration:.1f}s" if duration > 0
                         else f"读不出时长（{target.suffix} 容器 mutagen 不支持）"
                     ),
-                    expected=f"{entry.interval}s",
+                    expected=f"{entry.interval}s" if entry.interval > 0 else "该曲目没有 interval",
                     # 读不出时长 ≠ 校验通过. 标成 ok 会让人以为第 4 层跑过了.
-                    verdict=duration_check.verdict.value if duration > 0 else "unverified",
-                    detail=duration_check.detail or (
-                        "本层未能执行，试听检测只剩前三层" if duration <= 0 else ""
+                    verdict=duration_verdict,
+                    detail=duration_note,
+                ),
+            )
+            # 窗口比对是第 4 层里独立的一半: 两组窗口都缺席时它同样没跑.
+            # 先看窗口再看时长 —— 窗口都没有的话, 有没有时长都无从比起.
+            windows = entry.trial_windows
+            if not windows:
+                window_verdict = verify.LAYER_SKIPPED
+                window_note = "本层未执行：file 与 vi 两组窗口都没有"
+            elif duration <= 0:
+                window_verdict = verify.LAYER_UNVERIFIED
+                window_note = "本层未能执行：读不出时长"
+            elif duration_check.verdict is verify.Verdict.TRIAL:
+                window_verdict = duration_check.verdict.value
+                window_note = duration_check.detail
+            else:
+                window_verdict = "ok"
+                window_note = ""
+            self._diagnosis.add(
+                LayerResult(
+                    name="第4层 实际时长 vs 试听窗口",
+                    observed=f"{duration:.1f}s" if duration > 0 else "读不出时长",
+                    expected=(
+                        "、".join(f"{b}~{e}ms（{src}）" for b, e, src in windows)
+                        if windows else "该曲目 file 与 vi 两组窗口都没有"
                     ),
+                    verdict=window_verdict,
+                    detail=window_note,
                 ),
             )
 
@@ -792,6 +849,9 @@ class DownloadEngine:
             lyric_status=lyric_status,
             cover_status=cover_status,
             tag_status=tag_status,
+            # 读不出时长 = 第 4 层没跑成. 记下来, 汇总报告要把它从
+            # 「已完成四层校验」里摘出去.
+            verify_incomplete=actual_duration <= 0,
             error_message="",
             finished_at=int(time.time()),
         )

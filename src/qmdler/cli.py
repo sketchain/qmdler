@@ -563,6 +563,61 @@ async def _run_download(
         return 0 if not report.failures else 1
 
 
+@app.command()
+def verify(
+    directory: Annotated[str, typer.Argument(help="要校验的目录，递归扫描")],
+    as_json: Annotated[bool, typer.Option("--json", help="输出 JSON")] = False,
+    only_bad: Annotated[bool, typer.Option("--only-bad", help="只打印有问题的")] = False,
+) -> None:
+    """归档后的离线校验：把音频真正解一遍，确认容器有效、帧没坏。
+
+    **不在下载流程里做** —— 全量解码代价太大。下载时的四层校验只比对元数据，
+    这里补的是「文件到底能不能播」。
+
+    需要 ffmpeg / flac 才能跑全，缺了会跳过对应项并说明。
+
+    注意：普通 FLAC 上 `flac -t` 报 LOST_SYNC 是 QQ 侧尾部冗余字节所致，
+    音频完整。本命令的判据是「解码 PCM 的 MD5 == STREAMINFO 签名」，不是
+    `flac -t` 的退出码。
+    """
+    raise typer.Exit(_run_verify(directory=directory, as_json=as_json, only_bad=only_bad))
+
+
+def _run_verify(*, directory: str, as_json: bool, only_bad: bool) -> int:
+    import json as jsonlib
+    from pathlib import Path
+
+    from .core.archive_verify import have, verify_tree
+
+    root = Path(directory).expanduser()
+    if not root.exists():
+        console.print(f"[red]目录不存在：{root}[/red]")
+        return 2
+
+    verdicts = verify_tree(root)
+    if as_json:
+        console.print_json(jsonlib.dumps([v.as_dict() for v in verdicts], ensure_ascii=False))
+    else:
+        missing = [name for name in ("ffprobe", "ffmpeg", "flac") if not have(name)]
+        if missing:
+            console.print(f"[yellow]未安装 {'、'.join(missing)}，对应检查会跳过[/yellow]\n")
+        colors = {"ok": "green", "failed": "red", "skipped": "yellow", "note": "cyan"}
+        for verdict in verdicts:
+            if only_bad and verdict.status == "ok":
+                continue
+            color = colors.get(verdict.status, "white")
+            console.print(f"[{color}]{verdict.status:<8}[/{color}] {verdict.path}")
+            for name, state, detail in verdict.checks:
+                mark = colors.get(state, "white")
+                console.print(f"           [{mark}]{state:<8}[/{mark}] {name}"
+                              + (f" — {detail}" if detail else ""))
+        ok = sum(1 for v in verdicts if v.status == "ok")
+        bad = sum(1 for v in verdicts if v.status == "failed")
+        skipped = sum(1 for v in verdicts if v.status == "skipped")
+        console.print(f"\n[bold]{len(verdicts)} 个文件：通过 {ok} / 有问题 {bad} / 跳过 {skipped}[/bold]")
+    return 1 if any(v.status == "failed" for v in verdicts) else 0
+
+
 def main() -> None:
     """控制台入口."""
     try:

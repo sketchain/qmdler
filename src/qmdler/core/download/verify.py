@@ -42,6 +42,41 @@ class Verdict(str, Enum):
     DEGRADED = "degraded"
 
 
+#: 诊断输出专用的两个「这层没跑」状态. **它们不是 Verdict** —— 校验逻辑上
+#: 「没跑」等同于放行 (不能凭空判 trial), 但报告给人看时必须和「跑了且通过」
+#: 区分开.
+#:
+#: * ``skipped``: 数据本身就没有, 这层无从执行 (如 ``size_try == 0``);
+#: * ``unverified``: 数据本该有却拿不到 (如容器读不出时长).
+#:
+#: 差别在于要不要担心: ``skipped`` 是正常的, ``unverified`` 意味着这首歌的
+#: 试听检测确实少了一层, 汇总报告要单独点出来.
+LAYER_SKIPPED = "skipped"
+LAYER_UNVERIFIED = "unverified"
+
+
+def prefix_applicable(requested_quality: str, purl: str, filename: str = "") -> bool:
+    """第 1 层能不能跑: 请求档位有编码, 且从 purl/filename 里抠得出前缀."""
+    if not quality_start_code(requested_quality):
+        return False
+    return bool(extract_prefix(purl) or extract_prefix(filename))
+
+
+def trial_size_applicable(entry: SongEntry, content_length: int) -> bool:
+    """第 2 层能不能跑: 有 ``size_try`` 基准, 也探到了大小."""
+    return entry.size_try > 0 and content_length > 0
+
+
+def size_applicable(expected_size: int, actual_size: int) -> bool:
+    """第 3 层能不能跑: 期望大小与实际大小都拿到了."""
+    return expected_size > 0 and actual_size > 0
+
+
+def duration_applicable(entry: SongEntry, actual_seconds: float) -> bool:
+    """第 4 层能不能跑: 有 ``interval`` 基准, 也读出了时长."""
+    return entry.interval > 0 and actual_seconds > 0
+
+
 @dataclass(slots=True)
 class VerifyResult:
     """一次校验的结论."""

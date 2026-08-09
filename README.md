@@ -174,6 +174,26 @@ qmdler single 003w2xz20QlUZt --quality FLAC
 **输出里不会出现凭证、`musickey`、`vkey` 或完整 `purl`** —— `purl` 只打印最后一个路径段。
 真漏了会被自检拦住并拒绝打印。
 
+某一层因为数据缺失而**没能执行**时，它会标成 `skipped`（本来就没这项数据，正常）
+或 `unverified`（数据本该有却拿不到，这首歌确实少了一层校验），**绝不会标成 `ok`**。
+「没跑」看起来像「通过了」正是这个项目最怕的事。
+
+### 归档后的离线校验
+
+```bash
+qmdler verify ~/Music/我的歌单          # 递归扫描
+qmdler verify ~/Music --only-bad        # 只看有问题的
+qmdler verify ~/Music --json
+```
+
+下载时的四层校验只比对元数据，代价接近于零，但**证明不了文件真能播**。
+这个命令把音频真正解一遍：mutagen 读时长 → `ffprobe` 解析流信息 →
+`ffmpeg` 全量解码（stderr 必须为空）→ FLAC 再比对「解码 PCM 的 MD5 vs
+STREAMINFO 内嵌签名」。代价是整首解码，所以**刻意不放进下载流程**，由你归档后按需跑。
+
+`ffprobe` / `ffmpeg` / `flac` 都是**可选**的外部命令，不是运行时依赖；缺哪个就跳过
+哪一项并说明。`.part` 残片判 `failed`，`.nac` 判 `skipped`（无从校验，不是文件坏了）。
+
 ### CLI
 
 ```bash
@@ -485,7 +505,32 @@ src/qmdler/
 - **读不出时长时第 4 层等于没跑。** `.nac` 是腾讯自研容器，mutagen 读不出时长，
   `check_duration` 会因为 `actual_seconds <= 0` 直接放行 —— 看上去是「ok」，实际是
   这一层被跳过了。现在诊断输出把这种情况单独标成 `unverified`，普通运行也会打一条
-  warning，避免「四层校验」在无声中变成三层。
+  warning，汇总报告里也单列，避免「四层校验」在无声中变成三层。
+- **`refresh_key` 刷新后不变，只有 `musickey` 换新。** 实测一次 `refresh_credential`：
+  `musickey` 与 `musickey_create_time` 更新、有效期从 69.5h 回到 72h，
+  而 `refresh_key` 一字未改。**所以 `refresh_key` 是长期凭据** —— 它丢了就只能重新扫码，
+  凭证文件的 0600 权限与备份因此比看上去更重要。`login_type` / `musicid` / `encrypt_uin`
+  刷新前后不变，`device.json` 也必须是同一份（指纹变了会被当成换设备）。
+
+### 实测发现（2026-08，播放性验证）
+
+字节数对、sha256 对，**都不代表文件能播**。用 `ffprobe` / `ffmpeg` / `flac` 实测五种容器：
+
+- **普通 FLAC 上 `flac -t` 报 `LOST_SYNC`，但音频是完整的 —— 不是下载损坏。**
+  5 首普通 FLAC 全部如此，母带（`AI00`）则全部干净。排除下载问题的依据：重下一遍
+  sha256 逐字节相同；解码出的 PCM 字节数与 STREAMINFO 声明完全一致；**PCM 的 MD5 与
+  STREAMINFO 内嵌的签名逐位吻合**。文件尾是 `… 0e 55 ff f0`，`ff f0` 是半截帧同步字 ——
+  QQ 的普通 FLAC 在最后一帧之后多带了几个字节，官方解码器严格所以报错，ffmpeg 不在意。
+
+  **因此 `flac -t` 不能进下载流程的校验链**，否则每首正常的普通 FLAC 都会被误判。
+  正确的严格判据是「解码 PCM 的 MD5 == STREAMINFO 签名」，但全量解码代价太大，
+  同样不进流程 —— 放在 `qmdler verify` 里由用户按需跑。
+- **五种容器（FLAC / 母带 FLAC / MP3 / M4A / OGG）写 tag 前后 `ffmpeg` 全量解码 stderr 全空。**
+  写 tag 后 ffprobe 报的流数从 1 变 2，第二条是嵌入封面，容器结构没坏。
+  时长与 `interval` 差 +0.87\~0.94s（`interval` 取整到秒）。
+- **`.nac` 三样全废**：`ffprobe` / `ffmpeg` 一律 `Invalid data found when processing input`，
+  mutagen 既读不出时长也写不了 tag。文件能下下来（字节数与 `size_new[7]` 一致）但基本没法用，
+  所以在音质选择处直接标注出来，让人选之前就知道。
 
 ---
 

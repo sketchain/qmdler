@@ -43,6 +43,22 @@ QUALITY_TABLE: dict[str, tuple[str, tuple[str, int] | str]] = {
     "ACC_48": ("低品质 AAC 48k", "size_48aac"),
 }
 
+#: 档位级别的告警, 选之前就要让用户看见, 而不是下完才发现.
+#:
+#: ``NAC`` (``TL01``, ``.nac``) 是腾讯自研容器. 实测 (2026-08):
+#: ``ffprobe`` / ``ffmpeg`` 一律 ``Invalid data found when processing input``,
+#: mutagen 既读不出时长也写不了 tag —— 普通播放器、元数据、时长校验三样全废.
+#: 文件本身能下下来 (字节数与 ``size_new[7]`` 一致), 但基本没法用.
+QUALITY_CAVEATS: dict[str, str] = {
+    "NAC": "普通播放器不识别；不支持元数据写入与时长校验（第 4 层校验会被跳过）",
+}
+
+
+def quality_caveat(code: str) -> str:
+    """该档位的告警文案, 没有则为空串."""
+    return QUALITY_CAVEATS.get(code, "")
+
+
 #: 默认优先级链 (从高到低). 不含加密档位 —— 加密档位下载下来无法播放.
 DEFAULT_QUALITY_CHAIN: list[str] = [
     "FLAC",
@@ -499,6 +515,9 @@ class ItemRecord:
     lyric_status: SubStatus
     cover_status: SubStatus
     tag_status: SubStatus
+    #: 四层校验里有层没跑成 (如 ``.nac`` 读不出时长). ``success`` 但校验不完整,
+    #: 汇总报告要单列, 否则会给出「全部通过四层校验」的假象.
+    verify_incomplete: bool
     created_at: int
     updated_at: int
     started_at: int | None = None
@@ -543,6 +562,7 @@ class ItemRecord:
             "lyric_status": self.lyric_status.value,
             "cover_status": self.cover_status.value,
             "tag_status": self.tag_status.value,
+            "verify_incomplete": self.verify_incomplete,
             "pay_flags": self.entry.pay,
             "available_qualities": self.entry.available_qualities,
             "started_at": self.started_at,

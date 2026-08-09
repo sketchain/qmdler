@@ -134,6 +134,20 @@ export const TasksView = {
             </ul>
           </details>
 
+          <!-- 成功但四层校验没跑全：文件是完整的，但试听检测少了一层。
+               不点出来，报告就等于在说「全部通过四层校验」。 -->
+          <details v-if="store.report.incomplete_verification.length" open>
+            <summary>
+              校验层不完整（{{ store.report.incomplete_verification.length }}）——
+              计入成功，但四层校验没跑全（完整通过 {{ store.report.fully_verified }} 首）
+            </summary>
+            <ul class="mono">
+              <li v-for="row in store.report.incomplete_verification" :key="'v'+row.id">
+                {{ row.title }} — {{ row.actual_quality }}：容器读不出时长，第 4 层未执行
+              </li>
+            </ul>
+          </details>
+
           <details v-if="store.report.failures.length">
             <summary>失败（{{ store.report.failures.length }}）</summary>
             <ul class="mono">

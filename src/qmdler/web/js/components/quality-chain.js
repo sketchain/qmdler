@@ -21,6 +21,12 @@ export const QualityChain = {
       return found ? found.label : code;
     }
 
+    // 档位级别的告警（目前只有 NAC）。要在**选之前**就看见，不是下完才发现。
+    function caveatOf(code) {
+      const found = props.catalog.find((entry) => entry.code === code);
+      return found ? (found.caveat || '') : '';
+    }
+
     function move(index, delta) {
       const next = [...props.modelValue];
       const target = index + delta;
@@ -67,7 +73,7 @@ export const QualityChain = {
       if (sortable) sortable.destroy();
     });
 
-    return { listRef, labelOf, move, remove, add };
+    return { listRef, labelOf, caveatOf, move, remove, add };
   },
   template: `
     <div>
@@ -75,7 +81,10 @@ export const QualityChain = {
         <li v-for="(code, index) in modelValue" :key="code">
           <span class="chain__handle" title="拖动排序">⠿</span>
           <span class="chain__rank">{{ index + 1 }}</span>
-          <span class="chain__label">{{ labelOf(code) }}</span>
+          <span class="chain__label">
+            {{ labelOf(code) }}
+            <span v-if="caveatOf(code)" class="chain__caveat" :title="caveatOf(code)">⚠ {{ caveatOf(code) }}</span>
+          </span>
           <button class="btn--sm" @click="move(index, -1)" :disabled="index===0" aria-label="上移">↑</button>
           <button class="btn--sm" @click="move(index, 1)" :disabled="index===modelValue.length-1" aria-label="下移">↓</button>
           <button class="btn--sm btn--danger" @click="remove(index)" :disabled="modelValue.length<=1" aria-label="移除">✕</button>
@@ -85,7 +94,7 @@ export const QualityChain = {
         <select @change="add($event.target.value); $event.target.value=''" style="flex:1 1 auto">
           <option value="">＋ 添加档位…</option>
           <option v-for="entry in catalog.filter(e => !modelValue.includes(e.code))" :key="entry.code" :value="entry.code">
-            {{ entry.label }}（{{ entry.extension }}）
+            {{ entry.label }}（{{ entry.extension }}）{{ entry.caveat ? ' ⚠ ' + entry.caveat : '' }}
           </option>
         </select>
       </div>

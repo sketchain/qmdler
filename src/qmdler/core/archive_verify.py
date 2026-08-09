@@ -1,0 +1,227 @@
+"""归档后的离线校验 —— **刻意不接进下载流程**.
+
+下载流程里的四层校验只看「这文件是不是完整的正片」, 靠的是元数据比对,
+代价接近于零. 这里做的是另一件事: **把音频真正解一遍**, 确认容器有效、
+帧没坏. 代价是整首解码, 所以只能由用户在归档后按需跑:
+
+    qmdler verify ~/Music/我的歌单
+
+为什么不能进下载流程
+====================
+
+**``flac -t`` 会把正常的普通 FLAC 判成失败.** 实测 (2026-08, 5 首):
+QQ 的普通 FLAC 在最后一帧之后带了几个多余字节 (文件尾是 ``… 0e 55 ff f0``,
+``ff f0`` 是半截帧同步字), 官方解码器走到那里就 ``LOST_SYNC`` 然后 EOF.
+但**音频一位都不少** —— 解出的 PCM 字节数与 STREAMINFO 声明完全一致,
+且 PCM 的 MD5 与 STREAMINFO 内嵌的签名逐位吻合. 母带 (``AI00``) 则完全干净.
+
+所以正确的严格判据是「解码 PCM 的 MD5 == STREAMINFO 签名」, 而不是
+``flac -t`` 的退出码. 本模块就按这个判据来, 并把 ``flac -t`` 的抱怨降级成提示.
+
+依赖
+====
+
+``ffprobe`` / ``ffmpeg`` (可选) 与 ``flac`` (可选) 都是外部命令, **不是本项目的
+运行时依赖**. 缺哪个就跳过哪一项, 并在结果里说明 —— 不装也能跑, 只是校验得浅些.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import tempfile
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from .metadata.tagger import UNSUPPORTED_SUFFIXES, detect_duration
+
+#: 会去校验的容器. 其余后缀 (含 ``.part`` 残片) 一律不看.
+AUDIO_SUFFIXES: frozenset[str] = frozenset({".flac", ".mp3", ".ogg", ".m4a", ".mp4"})
+
+#: 单个外部命令的超时 (秒). 母带全量解码在慢盘上也就几十秒.
+COMMAND_TIMEOUT = 600
+
+
+@dataclass(slots=True)
+class FileVerdict:
+    """一个文件的校验结论."""
+
+    path: Path
+    #: ``ok`` / ``failed`` / ``skipped``
+    status: str = "ok"
+    duration: float = 0.0
+    codec: str = ""
+    sample_rate: int = 0
+    channels: int = 0
+    #: 逐项检查的结论, 顺序即执行顺序.
+    checks: list[tuple[str, str, str]] = field(default_factory=list)
+
+    def add(self, name: str, state: str, detail: str = "") -> None:
+        """记一项检查. ``state`` 为 ``ok`` / ``failed`` / ``skipped`` / ``note``."""
+        self.checks.append((name, state, detail))
+        if state == "failed":
+            self.status = "failed"
+
+    def as_dict(self) -> dict[str, Any]:
+        """转为可 JSON 序列化的字典."""
+        return {
+            "path": str(self.path),
+            "status": self.status,
+            "duration": round(self.duration, 2),
+            "codec": self.codec,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "checks": [{"name": n, "state": s, "detail": d} for n, s, d in self.checks],
+        }
+
+
+def have(command: str) -> bool:
+    """外部命令在不在."""
+    return shutil.which(command) is not None
+
+
+def _run(args: list[str]) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=COMMAND_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def iter_audio_files(root: Path) -> Iterator[Path]:
+    """递归找出要校验的音频文件, 顺带把 ``.nac`` 和 ``.part`` 挑出来另说."""
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and (path.suffix.lower() in AUDIO_SUFFIXES
+                               or path.suffix.lower() in UNSUPPORTED_SUFFIXES
+                               or path.suffix.lower() == ".part"):
+            yield path
+
+
+def verify_file(path: Path) -> FileVerdict:
+    """校验一个文件."""
+    verdict = FileVerdict(path=path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".part":
+        verdict.status = "failed"
+        verdict.add("残片", "failed", "这是没下完的 .part，不是成品")
+        return verdict
+
+    if suffix in UNSUPPORTED_SUFFIXES:
+        verdict.status = "skipped"
+        verdict.add("容器", "skipped", f"{suffix} 是腾讯自研容器，普通解码器不识别，无法校验")
+        return verdict
+
+    # mutagen 时长 —— 无外部依赖, 总是能跑.
+    verdict.duration = detect_duration(path)
+    if verdict.duration > 0:
+        verdict.add("mutagen 时长", "ok", f"{verdict.duration:.2f}s")
+    else:
+        verdict.add("mutagen 时长", "failed", "读不出时长，容器可能已损坏")
+
+    if have("ffprobe"):
+        _probe(path, verdict)
+    else:
+        verdict.add("ffprobe 解析", "skipped", "没装 ffprobe")
+
+    if have("ffmpeg"):
+        code, _out, err = _run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"])
+        if code == 0 and not err.strip():
+            verdict.add("ffmpeg 全量解码", "ok", "stderr 干净")
+        else:
+            verdict.add("ffmpeg 全量解码", "failed", err.strip()[:300] or f"退出码 {code}")
+    else:
+        verdict.add("ffmpeg 全量解码", "skipped", "没装 ffmpeg")
+
+    if suffix == ".flac":
+        _verify_flac(path, verdict)
+
+    return verdict
+
+
+def _probe(path: Path, verdict: FileVerdict) -> None:
+    code, out, err = _run([
+        "ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path),
+    ])
+    if code != 0:
+        verdict.add("ffprobe 解析", "failed", err.strip()[:300])
+        return
+    try:
+        info = json.loads(out)
+    except json.JSONDecodeError as exc:  # pragma: no cover - ffprobe 输出损坏
+        verdict.add("ffprobe 解析", "failed", str(exc))
+        return
+    streams: list[dict[str, Any]] = info.get("streams", [])
+    stream = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    if not stream:
+        verdict.add("ffprobe 解析", "failed", "没有音频流")
+        return
+    verdict.codec = str(stream.get("codec_name", ""))
+    verdict.sample_rate = int(stream.get("sample_rate") or 0)
+    verdict.channels = int(stream.get("channels") or 0)
+    verdict.add(
+        "ffprobe 解析", "ok",
+        f"{verdict.codec} {verdict.sample_rate}Hz {verdict.channels}ch",
+    )
+
+
+def _verify_flac(path: Path, verdict: FileVerdict) -> None:
+    """FLAC 的严格校验: 解码 PCM 的 MD5 必须等于 STREAMINFO 内嵌的签名.
+
+    这才是判据. ``flac -t`` 的退出码不是 —— 见模块 docstring.
+    """
+    if not have("flac"):
+        verdict.add("FLAC MD5 签名", "skipped", "没装 flac")
+        return
+
+    from mutagen.flac import FLAC
+
+    try:
+        info = FLAC(str(path)).info
+    except Exception as exc:  # 容器坏了是正常结果之一
+        verdict.add("FLAC MD5 签名", "failed", f"读不出 STREAMINFO: {exc}")
+        return
+
+    signature = getattr(info, "md5_signature", 0)
+    if not signature:
+        verdict.add("FLAC MD5 签名", "skipped", "STREAMINFO 里没有签名")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        raw = Path(tmp) / "decoded.raw"
+        # -F: 撞到 LOST_SYNC 也继续解完. QQ 的普通 FLAC 尾部有冗余字节,
+        # 不加这个参数会在最后一帧之后中断, 得不到完整 PCM.
+        code, _out, err = _run([
+            "flac", "-d", "-s", "-F", "--force-raw-format",
+            "--endian=little", "--sign=signed", "-f", "-o", str(raw), str(path),
+        ])
+        if not raw.exists():
+            verdict.add("FLAC MD5 签名", "failed", err.strip()[:300] or f"解码失败，退出码 {code}")
+            return
+        digest = hashlib.md5(raw.read_bytes(), usedforsecurity=False).hexdigest()
+        decoded_bytes = raw.stat().st_size
+
+    expected = info.total_samples * info.channels * (info.bits_per_sample // 8)
+    if digest == format(signature, "032x"):
+        verdict.add("FLAC MD5 签名", "ok", f"PCM {decoded_bytes} 字节，与 STREAMINFO 签名逐位吻合")
+        if err.strip():
+            # LOST_SYNC 这类抱怨降级成提示: 音频已经证明是完好的.
+            verdict.add(
+                "flac -t 提示", "note",
+                "解码器报了 LOST_SYNC，但 PCM 与签名一致 —— 是 QQ 普通 FLAC "
+                "尾部的冗余字节，不是损坏",
+            )
+    else:
+        verdict.add(
+            "FLAC MD5 签名", "failed",
+            f"PCM {decoded_bytes} 字节（预期 {expected}），MD5 与 STREAMINFO 签名不符",
+        )
+
+
+def verify_tree(root: Path) -> list[FileVerdict]:
+    """校验整个目录."""
+    return [verify_file(path) for path in iter_audio_files(root)]

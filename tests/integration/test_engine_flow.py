@@ -876,3 +876,126 @@ async def test_missing_tier_is_not_a_degrade(repo: Repository, settings: Setting
     assert item.requested_quality == "FLAC", "链上第一个**存在**的档位才是 requested"
     assert item.actual_quality == "FLAC"
     assert item.degraded is False
+
+
+# --------------------------------------------------------------------------- #
+# 「这层没跑」不得标 ok
+#
+# 静默少一层校验是本项目最怕的失效方式 —— `.nac` 上就真的发生过:
+# `check_duration` 因为 `actual_seconds <= 0` 直接放行, 诊断里打的是 `ok`,
+# 「四层校验」无声变成三层.
+# --------------------------------------------------------------------------- #
+
+
+async def test_layers_report_skipped_when_data_is_missing(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """缺 size_try / interval 时, 对应层标 skipped 而不是 ok."""
+    entry = make_entry("mid1", "歌一")
+    entry.size_try = 0        # 第 2 层无基准
+    entry.interval = 0        # 第 4 层无基准
+    entry.try_begin_ms = 0    # 两组试听窗口都缺席
+    entry.try_end_ms = 0
+    entry.vi = []
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    layers = {layer["name"]: layer["verdict"] for layer in diagnosis.as_dict()["layers"]}
+    assert layers["第2层 试听片段绝对大小基准（size_try）"] == "skipped"
+    assert layers["第4层 实际时长 vs interval"] == "skipped"
+    assert layers["第4层 实际时长 vs 试听窗口"] == "skipped"
+    # 有数据的层照常跑.
+    assert layers["第1层 filename 前缀"] == "ok"
+
+
+async def test_no_layer_claims_ok_without_running(repo: Repository, settings: Settings) -> None:
+    """兜底断言: 任何标了 ok 的层, 说明里都不能写着「本层未执行」."""
+    entry = make_entry("mid1", "歌一")
+    entry.size_try = 0
+    entry.interval = 0
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    for layer in diagnosis.as_dict()["layers"]:
+        if layer["verdict"] == "ok":
+            assert "未执行" not in layer["detail"], f"{layer['name']} 标了 ok 却没跑"
+
+
+async def test_duration_layers_actually_run_on_real_audio(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """喂真音频时, 第 4 层的两半都要真跑起来.
+
+    这条用例存在的意义: 其余用例的 payload 都是 ``b"x" * N``, mutagen 读不出
+    时长, 于是第 4 层永远是 ``unverified``. 光看那些用例, 分不出「实现正确」
+    和「第 4 层根本没跑过」—— 所以这里必须用一个真文件.
+    """
+    real = (Path(__file__).resolve().parents[1] / "data" / "audio" / "silence.mp3").read_bytes()
+    settings.quality.reject_trial = False  # 0.25 秒当然比 interval 短, 不拦
+    entry = make_entry("mid1", "歌一", size=len(real))
+    payloads = {"M500mid1.mp3": real}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    payload = diagnosis.as_dict()
+    layers = {layer["name"]: layer["verdict"] for layer in payload["layers"]}
+    assert layers["第4层 实际时长 vs interval"] not in ("skipped", "unverified")
+    assert layers["第4层 实际时长 vs 试听窗口"] not in ("skipped", "unverified")
+    assert payload["actual_duration"] > 0, "真文件必须读得出时长"
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.verify_incomplete is False, "读得出时长就不算校验不完整"
+
+
+async def test_report_separates_incomplete_verification(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """校验层不完整的曲目必须在报告里单列, 不能藏在 success 里.
+
+    否则报告会给出「全部通过四层校验」的假象, 而实际上有几首只跑了三层。
+    """
+    from qmdler.core.report import build_report, export_csv
+
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}  # 假字节 → 读不出时长
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.verify_incomplete is True
+
+    report = await build_report(repo, task.id)
+    assert report is not None
+    payload = report.as_dict()
+    assert len(payload["incomplete_verification"]) == 1
+    assert payload["fully_verified"] == 0, "成功 1 首，但没有一首跑全四层"
+    assert "校验层不完整" in payload["summary"]
+
+    csv_text = await export_csv(repo, task.id)
+    assert "校验完整" in csv_text.splitlines()[0]
+    assert "否（有层未执行）" in csv_text

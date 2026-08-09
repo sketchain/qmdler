@@ -260,6 +260,8 @@ table.tracks-table {
   user-select: none;
 }
 .chain__label { flex: 1 1 auto; min-width: 0; }
+/* 档位告警（NAC）——选之前就要看见，所以不折叠、不省略。 */
+.chain__caveat { display: block; font-size: 12px; line-height: 1.4; color: var(--warn, #b26a00); }
 .chain__rank { font-variant-numeric: tabular-nums; color: var(--text-faint); min-width: 22px; }
 .sortable-ghost { opacity: 0.4; }
 .sortable-chosen { box-shadow: var(--shadow); }
