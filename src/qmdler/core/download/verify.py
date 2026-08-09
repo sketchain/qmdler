@@ -9,8 +9,8 @@
 
 下载前 (看 URL 就能判断)
     1. 比对 ``purl`` 里 filename 的四字符前缀与请求档位的编码;
-    2. 对照 ``file.size_try`` / ``try_begin`` / ``try_end`` (以及 ``vi[4]`` /
-       ``vi[5]``) 交叉验证.
+    2. 与 ``file.size_try`` 做**绝对值**比对 —— 该值是试听片段的大小基准,
+       不是本曲正片的特征值, 详见 :func:`check_trial_size`.
 
 下载中/后 (看文件本身)
     3. Content-Length / 实际字节数 vs ``file.size_*``;
@@ -102,9 +102,23 @@ def check_prefix(requested_quality: str, purl: str, filename: str = "") -> Verif
 
 
 def check_trial_size(entry: SongEntry, content_length: int, *, tolerance: float = 0.02) -> VerifyResult:
-    """第 2 层: 与 ``size_try`` 交叉验证.
+    """第 2 层: 拿 ``size_try`` 当**试听片段的绝对大小基准**比对.
 
-    拿到的字节数正好等于试听片段大小, 基本可以坐实是试听.
+    ⚠️ ``size_try`` **不是本曲正片的特征值, 也不是常量**. 实测 12 首歌它只取到
+    三个值: ``960887`` (8 首)、``481070`` (1 首)、``0`` (3 首, 即该曲没有这项).
+    它是「试听片段有多大」的基准 —— ``960887 ≈ 128kbps × 60s``,
+    ``481070`` 差不多是它的一半 (30s), 上一轮实测 ``SpecialSongFileType.TRY``
+    (``RS02``) 片段的 Content-Length 正好等于 ``960887``.
+
+    所以拿它跟**正片**大小做「交叉验证」没有意义 (量纲都不对);
+    正确用法是**绝对值比对**: 探到/落盘的大小落在 ``size_try`` 的 ±tolerance 内
+    直接判 trial —— 与 ``interval`` 无关、与档位无关, 是极强的信号.
+
+    两条实现约束:
+
+    * 始终读 ``entry.size_try``, **不要硬编码 960887**. 它至少有两个取值,
+      高码率试听 (如 ``O802``) 也未必相同, 写死就会漏判;
+    * ``size_try == 0`` 时本层直接放行 —— 没有基准可比, 不能瞎判.
     """
     if entry.size_try <= 0 or content_length <= 0:
         return OK

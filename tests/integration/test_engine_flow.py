@@ -52,6 +52,8 @@ class FakeSongApi:
     def __init__(self) -> None:
         self.url_calls: list[list[Any]] = []
         self.behaviour: dict[str, str] = {}
+        #: mid -> 该首歌哪些档位取链失败 (result=104003), 用来构造降级链.
+        self.denied_qualities: dict[str, set[str]] = {}
         self.cdn_nodes = list(FakeSongApi.cdn_nodes)
 
     #: dispatch 返回的节点列表, 单个用例可覆盖.
@@ -86,7 +88,7 @@ class FakeSongApi:
             prefix = info.file_type.s
             if mode == "trial":
                 prefix = "RS02"
-            if mode == "denied":
+            if mode == "denied" or prefix in self.denied_qualities.get(info.mid, set()):
                 items.append(FakeUrlInfo(info.mid, "", "", result=104003))
                 continue
             items.append(
@@ -792,3 +794,85 @@ async def test_recent_success_expires(repo: Repository, settings: Settings) -> N
 
     node = CdnNode(base="https://x/", last_success=time_module.time() - SUCCESS_TTL - 1)
     assert node.tier == 1, "成功记录过期后退回「情况未知」，重新参与试探"
+
+
+# --------------------------------------------------------------------------- #
+# 降级链: requested / actual / degraded 的记账
+#
+# 实测上很难自然构造出这个场景 —— 2026-08 用真实凭证逐档探了 8 首歌共 105 个
+# `size_* > 0` 的档位, **无一取链失败**, 也就是说 `build_plan` 的 size 过滤已经
+# 把该挡的都挡掉了, 链上真正「有大小却取不到」的档位极其罕见.
+# 罕见不等于不会发生, 而且一旦发生, 记账错了用户就会拿到一个自以为是母带的 MP3.
+# 所以这里用确定性的方式把三个字段都钉住.
+# --------------------------------------------------------------------------- #
+
+
+async def test_degrade_records_requested_actual_and_flag(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """链头取链失败时, 降级到下一档并如实记账."""
+    settings.quality.chain = ["FLAC", "MP3_320", "MP3_128"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE, "MP3_128": FULL_SIZE}
+    payloads = {"M800mid1.mp3": b"y" * FULL_SIZE}
+    engine, client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    # FLAC 有大小但取不到, 应当落到 MP3_320.
+    client.song.denied_qualities["mid1"] = {"F000"}
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.requested_quality == "FLAC", "记的必须是链头, 不是实际拿到的那档"
+    assert item.actual_quality == "MP3_320"
+    assert item.degraded is True
+
+
+async def test_no_degrade_flag_when_chain_head_succeeds(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """链头就拿到了, 不能误标降级."""
+    settings.quality.chain = ["FLAC", "MP3_320"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE}
+    payloads = {"F000mid1.flac": b"y" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.requested_quality == "FLAC"
+    assert item.actual_quality == "FLAC"
+    assert item.degraded is False
+
+
+async def test_missing_tier_is_not_a_degrade(repo: Repository, settings: Settings) -> None:
+    """链头档位**不存在** (size 为 0) 属于正常选档, 不算降级.
+
+    实测绝大多数「没拿到母带」都是这一类 —— 该曲目根本没做过母带.
+    把它记成 degraded 会让降级统计彻底失真.
+    """
+    settings.quality.chain = ["MASTER", "FLAC", "MP3_320"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE}  # 没有 MASTER
+    payloads = {"F000mid1.flac": b"y" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.requested_quality == "FLAC", "链上第一个**存在**的档位才是 requested"
+    assert item.actual_quality == "FLAC"
+    assert item.degraded is False

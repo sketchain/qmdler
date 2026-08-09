@@ -49,7 +49,7 @@ def test_ogg640_not_confused_with_accompaniment() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 第 2 层: size_try 交叉验证
+# 第 2 层: size_try 作试听片段的**绝对大小基准**
 # --------------------------------------------------------------------------- #
 
 
@@ -69,6 +69,24 @@ def test_size_within_tolerance_of_size_try(entry: SongEntry) -> None:
 def test_full_size_is_not_trial(entry: SongEntry) -> None:
     """完整文件大小与 size_try 差得远, 不该误判."""
     assert verify.check_trial_size(entry, entry.sizes["FLAC"]).ok
+
+
+def test_size_try_is_never_hardcoded(entry: SongEntry) -> None:
+    """必须用响应里的 ``size_try``, 不能写死实测到的 960887.
+
+    实测该值在四首不同的歌上都是 960887, 极易被后来者当成常量写进代码.
+    但高码率试听 (``O802``) 的片段大小未必相同 —— 写死就会漏判.
+    """
+    entry.size_try = 2_500_000  # 假想的高码率试听片段
+    assert verify.check_trial_size(entry, 2_500_000).verdict is verify.Verdict.TRIAL
+    # 旧的恒定值此时不该再命中任何东西.
+    assert verify.check_trial_size(entry, 960_887).ok
+
+
+def test_size_try_match_ignores_interval_and_quality(entry: SongEntry) -> None:
+    """绝对值比对与 interval / 档位无关: 长曲目照样能判出试听片段."""
+    entry.interval = 3600  # 一小时的长音频
+    assert verify.check_trial_size(entry, entry.size_try).verdict is verify.Verdict.TRIAL
 
 
 def test_trial_window_falls_back_to_vi(entry: SongEntry) -> None:

@@ -351,10 +351,11 @@ def _print_diagnosis(payload: dict) -> None:
     console.print("[bold]四层校验[/bold]")
     if not payload["layers"]:
         console.print("  [dim](没有拿到可用链接，四层校验未执行)[/dim]")
-    colors = {"ok": "green", "trial": "magenta", "degraded": "yellow"}
+    colors = {"ok": "green", "trial": "magenta", "degraded": "yellow",
+              "failed": "red", "unverified": "yellow"}
     for layer in payload["layers"]:
         color = colors.get(layer["verdict"], "white")
-        console.print(f"  [{color}]{layer['verdict']:<8}[/{color}] {layer['name']}")
+        console.print(f"  [{color}]{layer['verdict']:<10}[/{color}] {layer['name']}")
         console.print(f"           实测: {layer['observed']}")
         if layer["expected"]:
             console.print(f"           期望: {layer['expected']}")
@@ -362,7 +363,9 @@ def _print_diagnosis(payload: dict) -> None:
             console.print(f"           说明: {layer['detail']}")
     console.print()
 
-    console.print(f"  试听窗口（全部候选，第 4 层逐个比对）  size_try={payload['size_try']}")
+    console.print(f"  试听窗口（全部候选，第 4 层逐个比对）  "
+                  f"size_try={payload['size_try']}"
+                  f"[dim]（试听片段的绝对大小基准，非本曲正片的特征值；0 表示该曲没有此项）[/dim]")
     for window in payload["trial_windows"]:
         console.print(f"    · {window['begin_ms']}~{window['end_ms']}ms "
                       f"（{window['seconds']}s，取自 [cyan]{window['source']}[/cyan]）")

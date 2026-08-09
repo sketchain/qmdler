@@ -612,12 +612,11 @@ class DownloadEngine:
             delta_note = f"差异 {delta}%" if delta is not None else ""
             self._diagnosis.add(
                 LayerResult(
-                    name="第2层 size_try 交叉验证",
+                    name="第2层 试听片段绝对大小基准（size_try）",
                     observed=f"探到 {content_length} 字节",
-                    expected=f"size_try={entry.size_try}，试听窗口 "
-                    + "、".join(
-                        f"{b}~{e}ms（{src}）" for b, e, src in self._diagnosis.trial_windows
-                    ),
+                    expected=f"≠ size_try={entry.size_try}（试听片段的绝对大小基准，"
+                    f"不是本曲正片的特征值；落在其 ±"
+                    f"{settings.quality.size_tolerance:.0%} 内即判 trial）",
                     verdict=pre_checks[1].verdict.value,
                     detail=pre_checks[1].detail,
                 ),
@@ -714,18 +713,28 @@ class DownloadEngine:
         # 第 3 / 4 层: 落盘后的字节数与时长.
         self._state.phase = "verifying"
         self._emit_state()
+        actual_duration = detect_duration(outcome.path)
         post_result = verify.combine(
             verify.check_trial_size(entry, outcome.bytes_written, tolerance=settings.quality.size_tolerance),
             verify.check_size(expected_size, outcome.bytes_written, tolerance=settings.quality.size_tolerance),
             verify.check_duration(
                 entry,
-                detect_duration(outcome.path),
+                actual_duration,
                 tolerance=settings.quality.duration_tolerance,
             ),
         )
+        if actual_duration <= 0:
+            # 读不出时长, 第 4 层等于没跑. 说出来 —— 静默少一层校验正是本项目最怕的事.
+            self._bus.log(
+                f"{entry.title}：{target.suffix} 容器读不出时长，第 4 层时长校验未执行，"
+                f"试听检测只剩前三层",
+                level="warning",
+                task_id=task.id,
+                item_id=item.id,
+            )
 
         if self._diagnosis is not None:
-            duration = detect_duration(outcome.path)
+            duration = actual_duration
             self._diagnosis.downloaded_bytes = outcome.bytes_written
             self._diagnosis.actual_duration = round(duration, 2)
             self._diagnosis.add(
@@ -744,10 +753,16 @@ class DownloadEngine:
             self._diagnosis.add(
                 LayerResult(
                     name="第4层 实际时长 vs interval",
-                    observed=f"{duration:.1f}s",
+                    observed=(
+                        f"{duration:.1f}s" if duration > 0
+                        else f"读不出时长（{target.suffix} 容器 mutagen 不支持）"
+                    ),
                     expected=f"{entry.interval}s",
-                    verdict=duration_check.verdict.value,
-                    detail=duration_check.detail,
+                    # 读不出时长 ≠ 校验通过. 标成 ok 会让人以为第 4 层跑过了.
+                    verdict=duration_check.verdict.value if duration > 0 else "unverified",
+                    detail=duration_check.detail or (
+                        "本层未能执行，试听检测只剩前三层" if duration <= 0 else ""
+                    ),
                 ),
             )
 
