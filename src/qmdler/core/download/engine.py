@@ -17,9 +17,10 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from qqmusic_api import Client
@@ -28,7 +29,8 @@ from ..auth.manager import AuthManager, NotLoggedInError
 from ..config.schema import Settings
 from ..events import EventBus, EventKind
 from ..fsutil import check_space, expand
-from ..metadata.service import MetadataService
+from ..metadata.cover import EMPTY_COVER
+from ..metadata.service import ExtraTags, LyricBundle, MetadataService
 from ..metadata.tagger import TagPayload, TagWriteError, detect_duration, supports, write_tags
 from ..models import (
     ItemRecord,
@@ -53,6 +55,9 @@ from .ratelimit import IntervalWaiter
 from .state import ActionOutcome, is_complete, resolve_action, summarize
 
 logger = logging.getLogger(__name__)
+
+#: `_best_effort` 的返回类型.
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -956,17 +961,36 @@ class DownloadEngine:
         quality: str,
         task: TaskRecord,
     ) -> tuple[SubStatus, SubStatus, SubStatus]:
-        """歌词 / 封面 / tag. 任何一项失败都不让整首歌算失败."""
+        """歌词 / 封面 / tag. **任何一项失败都不让整首歌算失败.**
+
+        这里的 ``_best_effort`` 不是防御性编程的摆设: 实测撞到过一次
+        ``song.get_producer`` 抛 pydantic ``ValidationError``
+        (上游模型的 ``Lst`` 字段没标 Optional, 服务端回 ``null`` 就炸),
+        结果**整首歌被记成 failed** —— 音频明明已经完整落盘了.
+        附加内容是锦上添花, 拿不到就标一下, 绝不能拖垮主流程.
+        """
         settings = self._settings
         self._state.phase = "metadata"
         self._emit_state()
 
-        lyric_bundle = await self._metadata.fetch_lyric(entry, settings.lyric)
+        lyric_bundle = await self._best_effort(
+            self._metadata.fetch_lyric(entry, settings.lyric),
+            what="歌词",
+            entry=entry,
+            task=task,
+            fallback=LyricBundle(status=SubStatus.FAILED),
+        )
         if lyric_bundle.status is SubStatus.OK:
             with contextlib.suppress(OSError):
                 self._metadata.write_lyric_files(lyric_bundle, path, settings.lyric)
 
-        embed_cover = await self._metadata.fetch_cover(entry, settings.cover, for_embed=True)
+        embed_cover = await self._best_effort(
+            self._metadata.fetch_cover(entry, settings.cover, for_embed=True),
+            what="封面",
+            entry=entry,
+            task=task,
+            fallback=EMPTY_COVER,
+        )
         cover_status = SubStatus.SKIPPED
         if settings.cover.enabled:
             cover_status = SubStatus.OK if embed_cover.ok else SubStatus.FAILED
@@ -974,14 +998,26 @@ class DownloadEngine:
                 save_cover = (
                     embed_cover
                     if settings.cover.save_size == settings.cover.embed_size
-                    else await self._metadata.fetch_cover(entry, settings.cover, for_embed=False)
+                    else await self._best_effort(
+                        self._metadata.fetch_cover(entry, settings.cover, for_embed=False),
+                        what="封面",
+                        entry=entry,
+                        task=task,
+                        fallback=EMPTY_COVER,
+                    )
                 )
                 if save_cover.ok:
                     name = settings.cover.file_name or "cover.jpg"
                     with contextlib.suppress(OSError):
                         self._metadata.write_cover_file(save_cover, path.parent / name)
 
-        extra = await self._metadata.fetch_extra_tags(entry, settings.tag)
+        extra = await self._best_effort(
+            self._metadata.fetch_extra_tags(entry, settings.tag),
+            what="作曲/作词/流派",
+            entry=entry,
+            task=task,
+            fallback=ExtraTags(),
+        )
 
         tag_status = SubStatus.SKIPPED
         if settings.tag.enabled:
@@ -1012,6 +1048,34 @@ class DownloadEngine:
                     tag_status = SubStatus.OK
 
         return lyric_bundle.status, cover_status, tag_status
+
+    async def _best_effort(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        what: str,
+        entry: Any,
+        task: TaskRecord,
+        fallback: _T,
+    ) -> _T:
+        """跑一个附加内容的获取, 出任何岔子都吞掉并返回兜底值.
+
+        这里**故意捕获 Exception 而不是某几个具体类型**: 附加内容的失败模式
+        来自上游模型与服务端返回的组合, 列不全 (实测就撞到过 pydantic 的
+        ``ValidationError``, 它既不是 ``BaseApiException`` 也不是网络错误).
+        音频已经完整落盘了, 没有任何理由让一个可选字段把它拖成 failed.
+        ``CancelledError`` 不在此列 —— 它不是 ``Exception`` 的子类, 会正常传上去.
+        """
+        try:
+            return await awaitable
+        except Exception as exc:  # 见 docstring: 附加内容绝不拖垮主流程
+            logger.warning("获取%s失败 %s: %s", what, getattr(entry, "songmid", "?"), exc)
+            self._bus.log(
+                f"{getattr(entry, 'title', '?')}：{what}获取失败，已跳过 — {type(exc).__name__}",
+                level="warning",
+                task_id=task.id,
+            )
+            return fallback
 
     # -- 收尾与状态 ----------------------------------------------------------- #
 

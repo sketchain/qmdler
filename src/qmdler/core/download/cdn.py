@@ -160,7 +160,10 @@ class CdnManager:
             self._pool = CdnPool(nodes=[CdnNode(base=FALLBACK_DOMAIN)], fetched_at=time.time())
             return self._pool
 
-        bases = [base for base in response.sip if base.startswith("http")]
+        # 去重: dispatch 实测会把同一个域名返回多次 (2026-08 实测 7 个节点里
+        # ``http://aqqmusic.tc.qq.com/`` 占了 3 个). 不去重的话同档内随机等于
+        # 给重复的那个加权, 而它恰好是不放行的那个 —— 白白多试两次.
+        bases = list(dict.fromkeys(base for base in response.sip if base.startswith("http")))
         if not bases:
             logger.warning("CDN dispatch 返回空列表, 使用兜底域名")
             bases = [FALLBACK_DOMAIN]

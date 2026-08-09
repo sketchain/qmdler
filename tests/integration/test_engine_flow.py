@@ -21,7 +21,7 @@ import pytest
 from qmdler.core.config.schema import Settings
 from qmdler.core.download.engine import DownloadEngine, new_task_id
 from qmdler.core.events import EventBus
-from qmdler.core.models import ItemStatus, SongEntry, TaskRecord, TaskStatus
+from qmdler.core.models import ItemStatus, SongEntry, SubStatus, TaskRecord, TaskStatus
 from qmdler.core.storage.repository import Repository
 
 CDN_BASE = "https://cdn.example.com/"
@@ -267,6 +267,7 @@ async def build_engine(
     *,
     cdn_nodes: list[str] | None = None,
     serving_hosts: set[str] | None = None,
+    metadata: Any = None,
 ) -> tuple[Any, ...]:
     """组装引擎."""
     client = FakeClient()
@@ -281,7 +282,7 @@ async def build_engine(
         repo,
         bus,
         settings,
-        FakeMetadata(),  # type: ignore[arg-type]
+        metadata or FakeMetadata(),  # type: ignore[arg-type]
         FakeSources(),  # type: ignore[arg-type]
         http,
     )
@@ -999,3 +1000,71 @@ async def test_report_separates_incomplete_verification(
     csv_text = await export_csv(repo, task.id)
     assert "校验完整" in csv_text.splitlines()[0]
     assert "否（有层未执行）" in csv_text
+
+
+async def test_dispatch_deduplicates_nodes(repo: Repository, settings: Settings) -> None:
+    """dispatch 返回重复域名时要去重.
+
+    实测 dispatch 会把 ``http://aqqmusic.tc.qq.com/`` 返回三次。不去重的话
+    同档内随机就等于给它加权，而它恰好是不放行的那个。
+    """
+    from qmdler.core.download.cdn import CdnManager
+
+    _engine, client, _bus, http, _auth = await build_engine(repo, settings, {})
+    client.song.cdn_nodes = [
+        "http://a.example.com/",
+        "http://b.example.com/",
+        "http://a.example.com/",
+        "http://a.example.com/",
+    ]
+    cdn = CdnManager(client)
+    pool = await cdn.dispatch()
+    await http.aclose()
+
+    bases = [node.base for node in pool.nodes]
+    assert bases == ["http://a.example.com/", "http://b.example.com/"], "重复域名要去掉，顺序保持"
+
+
+# --------------------------------------------------------------------------- #
+# 附加内容失败不得拖垮主流程
+#
+# 实测撞到过: `song.get_producer` 抛 pydantic ValidationError (上游模型的 `Lst`
+# 没标 Optional, 服务端回 null 就炸), 结果**整首歌被记成 failed** —— 音频明明
+# 已经完整落盘。附加内容是锦上添花, 拿不到就标一下。
+# --------------------------------------------------------------------------- #
+
+
+class ExplodingMetadata(FakeMetadata):
+    """每一项附加内容都炸, 而且炸的是 `BaseApiException` 之外的类型."""
+
+    async def fetch_lyric(self, entry: Any, config: Any) -> Any:
+        raise ValueError("歌词接口返回了模型吃不下的结构")
+
+    async def fetch_cover(self, entry: Any, config: Any, *, for_embed: bool) -> Any:
+        raise TypeError("封面接口返回了 None")
+
+    async def fetch_extra_tags(self, entry: Any, config: Any) -> Any:
+        raise ValueError("1 validation error for GetProducerResponse")
+
+
+async def test_metadata_failure_does_not_fail_the_song(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """三项附加内容全炸, 歌仍然要算成功, 文件仍然要在."""
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, bus, http, _auth = await build_engine(
+        repo, settings, payloads, metadata=ExplodingMetadata(),
+    )
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS, "附加内容失败不能把歌判成 failed"
+    assert item.bytes_downloaded == FULL_SIZE
+    assert Path(item.target_path).exists(), "音频文件必须留下"
+    assert item.lyric_status is SubStatus.FAILED

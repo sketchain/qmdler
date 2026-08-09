@@ -65,6 +65,14 @@ SENSITIVE_KEYS: frozenset[str] = frozenset(
         # 不是路径 —— 落盘自检抓到过, 别漏.
         "test_file",
         "keepalivefile",
+        # 第三方的身份信息. 不是凭证, 但没有理由把别人的昵称和头像地址
+        # 提交进公开仓库 —— 歌单详情里就带着歌单作者的这两项.
+        # 头像 URL 里还有 32 位十六进制哈希, 会直接把落盘自检打红.
+        "headurl",
+        "avatar",
+        "portrait",
+        "nick",
+        "nickname",
     },
 )
 
@@ -73,7 +81,8 @@ _PURL_RE = re.compile(r"^([0-9A-Za-z]{4})[0-9A-Za-z]+(\.[0-9A-Za-z]+)")
 
 #: 落盘前的自检: 命中任何一条就认为没脱干净.
 LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("疑似 vkey/ekey（32 位以上十六进制）", re.compile(r"\b[0-9A-F]{32,}\b")),
+    # 大小写都要认: 头像 URL 里的哈希是小写的, 只认大写就会漏.
+    ("疑似 vkey/ekey（32 位以上十六进制）", re.compile(r"\b[0-9A-Fa-f]{32,}\b")),
     ("QQ musickey", re.compile(r"Q_H_L_[0-9A-Za-z_-]+")),
     ("微信 musickey", re.compile(r"W_X_[0-9A-Za-z_-]+")),
     ("URL 里的 vkey 参数", re.compile(r"vkey=[0-9A-Za-z]+")),
