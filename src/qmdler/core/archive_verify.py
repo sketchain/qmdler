@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -129,18 +130,49 @@ def verify_file(path: Path) -> FileVerdict:
         verdict.add("ffprobe 解析", "skipped", "没装 ffprobe")
 
     if have("ffmpeg"):
-        code, _out, err = _run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"])
-        if code == 0 and not err.strip():
-            verdict.add("ffmpeg 全量解码", "ok", "stderr 干净")
-        else:
-            verdict.add("ffmpeg 全量解码", "failed", err.strip()[:300] or f"退出码 {code}")
+        _decode(path, verdict)
     else:
-        verdict.add("ffmpeg 全量解码", "skipped", "没装 ffmpeg")
+        verdict.add("ffmpeg 音频解码", "skipped", "没装 ffmpeg")
 
     if suffix == ".flac":
         _verify_flac(path, verdict)
 
     return verdict
+
+
+#: ffmpeg 的诊断行前缀形如 ``[mjpeg @ 0x...]``. 音频文件里用到 mjpeg 的
+#: 只可能是内嵌封面, 所以按这个标签就能把封面的抱怨和音频的问题分开.
+_COVER_DECODER_RE = re.compile(r"^\[(?:mjpeg|png|image2)\s*@")
+
+
+def _decode(path: Path, verdict: FileVerdict) -> None:
+    """全量解码, 并把**内嵌封面的抱怨**与**音频的问题**分开.
+
+    为什么要分: QQ 的封面 JPEG **自带一个损坏的 EXIF TIFF 头**
+    (实测直接从 CDN 下下来的原图就报, 与我们的嵌入无关, 字节完全一致).
+    不分的话 20 首里有 4 首会因为一张图的 EXIF 被判成「音频解码失败」——
+    既是误报, 又会把真正的音频问题淹掉.
+
+    ⚠️ 用 ``-map 0:a`` / ``-vn`` **挡不住**这条: ffmpeg 在打开输入、探测流的
+    阶段就已经解过那张附图了, 与后面映射谁无关. 试过 ``-map 0:a``、``-vn``、
+    ``-map 0:a:0``、``-vn -sn -dn``, 四种都照报. 所以只能按 stderr 的
+    解码器标签分类.
+    """
+    _code, _out, err = _run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "null", "-"])
+    lines = [line for line in err.strip().splitlines() if line.strip()]
+    cover_lines = [line for line in lines if _COVER_DECODER_RE.match(line.strip())]
+    audio_lines = [line for line in lines if line not in cover_lines]
+
+    if audio_lines:
+        verdict.add("ffmpeg 音频解码", "failed", " / ".join(audio_lines)[:300])
+    else:
+        verdict.add("ffmpeg 音频解码", "ok", "stderr 干净（封面的抱怨不算）")
+
+    if cover_lines:
+        verdict.add(
+            "内嵌封面", "note",
+            f"解码器对封面有意见（不影响音频）：{cover_lines[0][:120]}",
+        )
 
 
 def _probe(path: Path, verdict: FileVerdict) -> None:

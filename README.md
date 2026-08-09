@@ -543,6 +543,14 @@ src/qmdler/
 - **五种容器（FLAC / 母带 FLAC / MP3 / M4A / OGG）写 tag 前后 `ffmpeg` 全量解码 stderr 全空。**
   写 tag 后 ffprobe 报的流数从 1 变 2，第二条是嵌入封面，容器结构没坏。
   时长与 `interval` 差 +0.87\~0.94s（`interval` 取整到秒）。
+- **QQ 的封面 JPEG 自带一个损坏的 EXIF TIFF 头。** `ffmpeg` 解带封面的音频文件时
+  会打 `mjpeg: invalid TIFF header in EXIF data`。这是 QQ 侧的图就有的问题
+  （直接从 CDN 下下来的原图照报，与嵌入无关，字节完全一致），**不影响音频**。
+
+  注意 `-map 0:a` / `-vn` **挡不住**这条 —— ffmpeg 在打开输入探测流的阶段就已经解过
+  那张附图了。所以 `qmdler verify` 是按 stderr 的解码器标签（`[mjpeg @ ...]`）
+  把封面的抱怨和音频的问题分开，前者记 `note`，后者才算 `failed`。
+  不分的话 20 首里有 4 首会被误判成音频损坏，真正的音频问题反而被淹掉。
 - **`.nac` 三样全废**：`ffprobe` / `ffmpeg` 一律 `Invalid data found when processing input`，
   mutagen 既读不出时长也写不了 tag。文件能下下来（字节数与 `size_new[7]` 一致）但基本没法用，
   所以在音质选择处直接标注出来，让人选之前就知道。

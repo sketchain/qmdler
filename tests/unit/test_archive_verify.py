@@ -64,7 +64,7 @@ def test_missing_external_tools_are_skipped(tmp_path: Path, monkeypatch: pytest.
     verdict = archive_verify.verify_file(path)
     states = {name: state for name, state, _ in verdict.checks}
     assert states["ffprobe 解析"] == "skipped"
-    assert states["ffmpeg 全量解码"] == "skipped"
+    assert states["ffmpeg 音频解码"] == "skipped"
     assert states["FLAC MD5 签名"] == "skipped"
     assert verdict.status == "ok", "缺工具不等于文件有问题"
 
@@ -110,3 +110,58 @@ def test_verify_tree_is_recursive(tmp_path: Path) -> None:
     verdicts = archive_verify.verify_tree(tmp_path)
     assert len(verdicts) == 1
     assert verdicts[0].path.name == "song.flac"
+
+
+def test_cover_complaints_are_not_audio_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内嵌封面的抱怨不能算音频损坏.
+
+    QQ 的封面 JPEG 自带一个损坏的 EXIF TIFF 头（从 CDN 下下来的原图就报，
+    与嵌入无关）。实测 20 首里有 4 首会因为这个被误判成音频解码失败 ——
+    既是误报，又会把真正的音频问题淹掉。
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[0] == "ffmpeg":
+            return 0, "", "[mjpeg @ 0x55f7a53ed340] mjpeg: invalid TIFF header in EXIF data\n"
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "ok"
+    assert states["内嵌封面"] == "note"
+    assert verdict.status != "failed", "一张图的 EXIF 不能把整个文件判成损坏"
+
+
+def test_real_audio_errors_still_fail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """真正的音频解码错误不能被封面豁免顺手放过."""
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[0] == "ffmpeg":
+            return 1, "", (
+                "[mjpeg @ 0x1] mjpeg: invalid TIFF header in EXIF data\n"
+                "[flac @ 0x2] Frame CRC mismatch\n"
+            )
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "failed"
+    details = {name: detail for name, _state, detail in verdict.checks}
+    assert "CRC" in details["ffmpeg 音频解码"]
+    assert verdict.status == "failed"
