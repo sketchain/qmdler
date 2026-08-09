@@ -3,14 +3,45 @@
 ``purl`` 是**相对路径**, 必须先 ``client.song.get_cdn_dispatch()`` 拿到 ``sip``
 域名列表, ``cdn + purl`` 才能下载.
 
-策略 (按实测结果调整过, 不是简单随机挑一个):
+====================================================================
+关于 403 —— 这是本模块唯一无法从代码推导出的经验知识, 改动前务必读完
+====================================================================
+
+**403 表示「这个节点不服务这条 purl」, 既不是链接失效, 也不是节点故障.**
+
+实测依据 (2026-08, 未登录取试听档, 12 首不同的歌):
+
+1. dispatch 返回 6 个节点, 用 ``GetCdnDispatchResponse.test_file`` 这个 keepalive
+   探针逐个探, **6/6 全部返回 200** —— 排除「节点挂了」;
+2. 同一条 purl 在放行节点上可以稳定、完整地下下来 (下载 + 续传 + 逐字节比对均通过)
+   —— 排除「vkey 过期」;
+3. 12 条不同的 purl, 放行分布高度一致::
+
+       https://sjy6.stream.qqmusic.qq.com/   12/12 放行
+       http://sjy6.stream.qqmusic.qq.com/    10/12 放行
+       http://aqqmusic.tc.qq.com/             0/12
+       https://aqqmusic.tc.qq.com/            0/12
+       http://ws.stream.qqmusic.qq.com/       0/12
+       http://ws6.stream.qqmusic.qq.com/      0/12
+
+   随机挑一个的首次命中率 30.6%, 固定挑历史最优节点则是 100%.
+
+**因此: 遇到 403 换节点重试同一条 purl (零额外 API 请求), 不要重新取 vkey.**
+把 403 当成链接失效去重新取 vkey, 会让每首歌多打好几次 ``get_song_urls`` ——
+正是最典型的风控特征. 这个坑踩过一次, 别再把 403 加回 ``STALE_LINK_STATUSES``.
+
+由第 3 点还可以看出: 放行与否在不同 purl 之间是稳定的, 更像是客户端/出口 IP 维度
+的属性, 而不是 (purl, node) 的一次性绑定. 所以节点级偏好是有价值的 (30.6% → 100%),
+但**必须是可以变的**: 用「最近一次成功」+「自上次成功以来的连续拒绝数」来排序,
+一次成功即清零拒绝计数, 网络环境变了能自动跟着换.
+
+真正一次性的是**本首歌本条 purl 已经拒过的节点**, 那个由调用方按 purl 维护,
+处理完这首歌即丢弃, 不跨曲目累积 (否则跑十几首之后所有节点都带着拒绝记录,
+排序就退化成随机了).
+
+其余策略:
 
 * 任务开始时 dispatch 一次并缓存;
-* 每首歌拿到一个**有序**的候选列表 —— 已验证可用的排前面, 没试过的居中,
-  曾经拒绝过的垫底; 同一档内随机, 分散压力;
-* 403 记 ``rejections`` 而**不是** ``failures``: 实测同一条 purl 在 6 个节点里
-  往往只有 1 个放行, 其余全 403, 但这 6 个节点的 keepalive 探针都返回 200 ——
-  节点是好的, 只是不服务这条链接. 换节点重试即可, 不必重新取 vkey;
 * 连接层面连续失败 (超时/5xx) 才剔除节点; 全部失效时重新 dispatch;
 * dispatch 整个失败时用库内置的兜底域名.
 """
@@ -30,8 +61,15 @@ logger = logging.getLogger(__name__)
 #: 库里写死的兜底域名 (``SongApi._SONG_URL_FALLBACK_DOMAIN``).
 FALLBACK_DOMAIN = "https://isure.stream.qqmusic.qq.com/"
 
-#: 连续失败多少次就把这个 CDN 剔除.
+#: 连接层面连续失败多少次就把这个 CDN 剔除 (403 不计入).
 MAX_CONSECUTIVE_FAILURES = 3
+
+#: 「最近成功过」的有效期 (秒). 超过就退回「未知」重新试探, 免得网络环境变了
+#: 还死守着一个早就不放行的节点.
+SUCCESS_TTL = 30 * 60
+
+#: 自上次成功以来连续拒绝多少次, 就不再把它当优选节点.
+MAX_REJECTIONS_BEFORE_DEMOTE = 2
 
 
 @dataclass(slots=True)
@@ -39,29 +77,41 @@ class CdnNode:
     """一个 CDN 节点."""
 
     base: str
-    #: 连接层面的失败 (超时、5xx).
+    #: 连接层面的失败 (超时、5xx). 只有这个会导致节点被剔除.
     failures: int = 0
-    #: 拒绝服务本次 purl 的次数 (403). 与节点健康无关 —— 实测中同一个 purl
-    #: 在多数节点上都是 403, 只有其中一个能放行, 但所有节点的 keepalive 探针
-    #: 都返回 200. 详见 ``CdnManager.candidates``.
-    rejections: int = 0
-    #: 成功服务过的次数. 服务过一次的节点大概率还能继续服务.
+    #: **自上次成功以来**的连续 403 次数. 一次成功即清零 —— 不是永久污点,
+    #: 否则跑一阵之后所有节点都带着拒绝记录, 排序退化成随机.
+    rejections_since_success: int = 0
+    #: 累计成功次数 (仅用于观察).
     successes: int = 0
+    #: 最近一次成功的时间戳. 排序看的是它, 不是累计次数.
+    last_success: float = 0.0
     last_used: float = 0.0
 
     @property
     def healthy(self) -> bool:
-        """是否还在可用集合里."""
+        """是否还在可用集合里 (只看连接层面的失败)."""
         return self.failures < MAX_CONSECUTIVE_FAILURES
 
     @property
+    def recently_served(self) -> bool:
+        """最近是否成功服务过, 且此后没有连续被拒."""
+        if not self.last_success or time.time() - self.last_success > SUCCESS_TTL:
+            return False
+        return self.rejections_since_success < MAX_REJECTIONS_BEFORE_DEMOTE
+
+    @property
     def tier(self) -> int:
-        """候选优先级: 0 已验证可用 / 1 未试过 / 2 曾经拒绝过."""
-        if self.successes > 0:
+        """候选优先级: 0 最近成功过 / 1 情况未知 / 2 最近连续被拒.
+
+        注意三档都是**可逆**的: 成功清零拒绝计数, 成功记录也会随
+        :data:`SUCCESS_TTL` 过期退回「未知」.
+        """
+        if self.recently_served:
             return 0
-        if self.rejections == 0:
-            return 1
-        return 2
+        if self.rejections_since_success >= MAX_REJECTIONS_BEFORE_DEMOTE:
+            return 2
+        return 1
 
 
 @dataclass(slots=True)
@@ -128,20 +178,16 @@ class CdnManager:
         candidates = await self.candidates()
         return candidates[0]
 
-    async def candidates(self) -> list[CdnNode]:
+    async def candidates(self, exclude: set[str] | None = None) -> list[CdnNode]:
         """返回本次下载要依次尝试的节点顺序.
 
-        **不是简单随机挑一个.** 实测 (未登录取试听档, 2026-08) 发现: 同一个
-        ``purl`` 在 dispatch 返回的 6 个节点里只有 1 个放行, 其余全部 403 ——
-        但这 6 个节点的 keepalive 探针 (``GetCdnDispatchResponse.test_file``)
-        都返回 200. 也就是说 403 是「这个节点不给这条 purl」, 不是节点挂了,
-        更不是 vkey 过期.
+        Args:
+            exclude: **本条 purl** 已经拒过的节点 base. 由调用方按 purl 维护,
+                这首歌处理完就丢掉 —— 绝不能攒到节点上跨曲目累积, 否则跑一阵
+                之后所有节点都带着拒绝记录, 排序就退化成随机了.
 
-        所以策略是: 同一条 purl 依次换节点重试 (不花任何额外 API 请求),
-        而不是一遇 403 就重新取 vkey —— 后者会把每首歌的接口请求数翻好几倍,
-        正是最该避免的风控特征.
-
-        顺序: 已验证可用 → 没试过 → 曾经拒绝过; 同一档内随机, 分散压力.
+        顺序: 最近成功过 → 情况未知 → 最近连续被拒; 同档内随机, 分散压力.
+        三档都是可逆的, 见 :attr:`CdnNode.tier`. 依据见模块 docstring.
         """
         await self.ensure()
         healthy = self._pool.healthy_nodes
@@ -150,9 +196,10 @@ class CdnManager:
             await self.dispatch()
             healthy = self._pool.healthy_nodes or [CdnNode(base=FALLBACK_DOMAIN)]
 
-        ordered = list(healthy)
+        skip = exclude or set()
+        ordered = [node for node in healthy if node.base not in skip]
         random.shuffle(ordered)
-        ordered.sort(key=lambda node: (node.tier, -node.successes))
+        ordered.sort(key=lambda node: (node.tier, -node.last_success))
         for node in ordered:
             node.last_used = time.time()
         return ordered
@@ -169,16 +216,20 @@ class CdnManager:
             logger.warning("CDN 节点连续失败 %d 次, 已剔除: %s", node.failures, node.base)
 
     def report_rejection(self, node: CdnNode) -> None:
-        """报告一次 403: 该节点不给这条 purl.
+        """报告一次 403: 该节点不服务这条 purl.
 
-        不计入 ``failures`` —— 节点本身是好的, 只是不服务这条链接.
+        **不计入** ``failures`` —— 节点本身是好的 (keepalive 探针 200),
+        只是不给这条链接. 记的是「自上次成功以来」的连续拒绝数, 成功即清零,
+        所以这不是永久污点.
         """
-        node.rejections += 1
+        node.rejections_since_success += 1
 
     def report_success(self, node: CdnNode) -> None:
-        """报告一次成功, 清零失败计数并记一次成功."""
+        """报告一次成功: 清零失败与拒绝计数, 刷新最近成功时间."""
         node.failures = 0
+        node.rejections_since_success = 0
         node.successes += 1
+        node.last_success = time.time()
 
     @property
     def snapshot(self) -> dict[str, object]:
@@ -191,8 +242,10 @@ class CdnManager:
                 {
                     "base": node.base,
                     "failures": node.failures,
-                    "rejections": node.rejections,
+                    "rejections_since_success": node.rejections_since_success,
                     "successes": node.successes,
+                    "last_success": node.last_success,
+                    "tier": node.tier,
                 }
                 for node in self._pool.nodes
             ],

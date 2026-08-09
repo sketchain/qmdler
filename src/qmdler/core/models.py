@@ -269,28 +269,38 @@ class SongEntry:
         return self.status == 3
 
     @property
+    def trial_windows(self) -> list[tuple[int, int, str]]:
+        """全部已知的试听窗口 ``(开始ms, 结束ms, 来源)``.
+
+        ``file.try_begin/try_end`` 与 ``vi[4]/vi[5]`` **不是主备关系, 而是两个
+        并列候选**. 实测「晴天」: ``file`` 给 84346~142843ms (58.5s), ``vi`` 给
+        84346~114346ms (30s) —— 差距太大, 不像取整误差, 更像是不同档位各有各的
+        试听区间.
+
+        所以两个都要留着, 时长校验时**任意一个命中就判 trial**. 漏判 trial 正是
+        这个项目最怕的方向, 不能因为选了其中一个就对另一个视而不见.
+        """
+        windows: list[tuple[int, int, str]] = []
+        if self.try_end_ms > self.try_begin_ms:
+            windows.append((self.try_begin_ms, self.try_end_ms, "file.try_begin/try_end"))
+        if len(self.vi) > 5:
+            begin, end = self.vi[4], self.vi[5]
+            if end > begin and (begin, end) != (self.try_begin_ms, self.try_end_ms):
+                windows.append((begin, end, "vi[4]/vi[5]"))
+        return windows
+
+    @property
     def trial_window_ms(self) -> tuple[int, int]:
-        """试听片段的 (开始, 结束) 毫秒."""
-        begin, end, _ = self.trial_window_with_source
-        return begin, end
+        """展示用的默认窗口 (``file`` 优先). **判定不要只用这一个**, 见
+        :attr:`trial_windows`."""
+        windows = self.trial_windows
+        return (windows[0][0], windows[0][1]) if windows else (0, 0)
 
     @property
     def trial_window_with_source(self) -> tuple[int, int, str]:
-        """试听窗口及其取值来源.
-
-        优先用 ``file.try_begin`` / ``try_end``; 缺失时回退到 ``vi[4]`` / ``vi[5]``.
-
-        两者**未必一致**: 实测「晴天」给的是 ``file`` 84346~142843ms (58.5s) 而
-        ``vi`` 是 84346~114346ms (30s), 实际试听文件 960887 字节按 128kbps 算
-        约 60s —— 与 ``file`` 吻合. 所以 ``file`` 优先是有实测依据的, 不是随手排的.
-        """
-        if self.try_end_ms > self.try_begin_ms:
-            return self.try_begin_ms, self.try_end_ms, "file.try_begin/try_end"
-        begin = self.vi[4] if len(self.vi) > 4 else 0
-        end = self.vi[5] if len(self.vi) > 5 else 0
-        if end > begin:
-            return begin, end, "vi[4]/vi[5]"
-        return 0, 0, "(无)"
+        """展示用的默认窗口及其来源. 判定请用 :attr:`trial_windows`."""
+        windows = self.trial_windows
+        return windows[0] if windows else (0, 0, "(无)")
 
     @property
     def replaygain(self) -> tuple[float, float] | None:

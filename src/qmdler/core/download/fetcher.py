@@ -33,11 +33,22 @@ from .cdn import CdnManager, CdnNode
 logger = logging.getLogger(__name__)
 
 #: 链接确实失效 (资源没了), 需要重新取 vkey.
+#:
+#: ⚠️ **403 不在这里, 而且不要把它加回来.** 详见下面 ``REJECT_STATUSES`` 的说明
+#: 与 ``cdn.py`` 的模块 docstring —— 那是一条实测得出、无法从代码推导的结论,
+#: 加错一次就会让每首歌多打好几次 ``get_song_urls``.
 STALE_LINK_STATUSES = frozenset({404, 410})
 
-#: 节点拒绝服务这条 purl. **不代表链接失效** —— 换个节点用同一条 purl 往往就能下.
-#: 实测同一条 purl 在 6 个 dispatch 节点里只有 1 个放行, 其余全 403,
-#: 而所有节点的 keepalive 探针都是 200.
+#: 节点拒绝服务这条 purl. **不代表链接失效, 也不代表节点故障.**
+#:
+#: 实测 (2026-08, 12 首不同的歌):
+#:
+#: * dispatch 的 6 个节点用 keepalive 探针逐个探, 6/6 返回 200 → 排除节点故障;
+#: * 同一条 purl 在放行节点上可以稳定下完并逐字节校验通过 → 排除 vkey 过期;
+#: * 放行分布在 12 条不同 purl 上高度一致 (sjy6 12/12, 其余 4 个 0/12).
+#:
+#: 所以遇到 403 应当**换节点重试同一条 purl** (零额外 API 请求),
+#: 而不是当成链接失效去重新取 vkey.
 REJECT_STATUSES = frozenset({401, 403})
 
 CHUNK_SIZE = 256 * 1024

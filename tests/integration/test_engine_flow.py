@@ -610,8 +610,11 @@ async def test_prefers_known_good_node_on_subsequent_songs(repo: Repository, set
     snapshot = engine._cdn.snapshot
     good = next(node for node in snapshot["nodes"] if "good" in node["base"])
     assert good["successes"] >= 4
+    assert good["tier"] == 0, "成功过的节点应当排在最前"
+    assert good["rejections_since_success"] == 0, "成功要清零拒绝计数"
+
     # 摸清之后就不该再往被拒的节点上撞: 只有第一首可能撞, 上限是 节点数-1。
-    total_rejections = sum(node["rejections"] for node in snapshot["nodes"])
+    total_rejections = sum(node["rejections_since_success"] for node in snapshot["nodes"])
     assert total_rejections <= len(REJECTING_NODES) - 1, f"仍在反复撞被拒节点: {snapshot['nodes']}"
 
 
@@ -730,3 +733,62 @@ async def test_diagnosis_skips_download_interval(repo: Repository, settings: Set
 
     counts = await repo.status_counts(task.id)
     assert counts[ItemStatus.SUCCESS.value] == 2
+
+
+async def test_rejections_do_not_accumulate_across_songs(repo: Repository, settings: Settings) -> None:
+    """「这条 purl 被谁拒过」是 per-purl 的, 换歌就丢.
+
+    若把拒绝记录攒在节点上跨曲目累积, 跑一阵之后所有节点都会带着拒绝记录,
+    分档退化成随机 —— 这轮的修复会在第 20 首左右悄悄失效.
+    """
+    entries = [make_entry(f"mid{i}", f"歌{i}") for i in range(1, 6)]
+    payloads = {f"M500{e.songmid}.mp3": b"x" * FULL_SIZE for e in entries}
+    engine, _client, _bus, http, _auth = await build_engine(
+        repo,
+        settings,
+        payloads,
+        cdn_nodes=REJECTING_NODES,
+        serving_hosts={"good.example.com"},
+    )
+    task = await make_task(repo, settings, entries)
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 5
+
+    # per-purl 记录在每首歌开始时清空, 跑完不该留下一大堆
+    assert len(engine._purl_rejections) <= 1, f"per-purl 拒绝记录在累积: {engine._purl_rejections}"
+
+    # 放行节点始终是 tier 0，从未被降级
+    snapshot = engine._cdn.snapshot
+    good = next(node for node in snapshot["nodes"] if "good" in node["base"])
+    assert good["tier"] == 0
+
+
+async def test_success_clears_rejection_penalty(repo: Repository, settings: Settings) -> None:
+    """一次成功就清零拒绝计数 —— 拒绝不是永久污点, 网络环境变了能跟着换."""
+    from qmdler.core.download.cdn import CdnManager, CdnNode
+
+    manager = CdnManager(client=None)  # type: ignore[arg-type]
+    node = CdnNode(base="https://x/")
+
+    manager.report_rejection(node)
+    manager.report_rejection(node)
+    assert node.tier == 2, "连续被拒应当降到最后一档"
+
+    manager.report_success(node)
+    assert node.rejections_since_success == 0
+    assert node.tier == 0, "成功之后应当立刻回到首选"
+
+
+async def test_recent_success_expires(repo: Repository, settings: Settings) -> None:
+    """「最近成功过」会过期 —— 免得死守一个早就不放行的节点."""
+    import time as time_module
+
+    from qmdler.core.download.cdn import SUCCESS_TTL, CdnNode
+
+    node = CdnNode(base="https://x/", last_success=time_module.time() - SUCCESS_TTL - 1)
+    assert node.tier == 1, "成功记录过期后退回「情况未知」，重新参与试探"

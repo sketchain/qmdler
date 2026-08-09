@@ -72,10 +72,77 @@ def test_full_size_is_not_trial(entry: SongEntry) -> None:
 
 
 def test_trial_window_falls_back_to_vi(entry: SongEntry) -> None:
-    """file.try_begin/try_end 缺失时回退到 vi[4]/vi[5]."""
+    """file.try_begin/try_end 缺失时展示 vi[4]/vi[5]."""
     entry.try_begin_ms = 0
     entry.try_end_ms = 0
     assert entry.trial_window_ms == (60000, 90000)
+
+
+# --------------------------------------------------------------------------- #
+# 试听窗口是「并列候选」而非「主备」
+#
+# 实测「晴天」: file 给 84346~142843ms (58.5s), vi 给 84346~114346ms (30s)。
+# 差距太大不像取整误差, 更像是不同档位各有各的试听区间 —— 所以两个都要比对,
+# 只比对被选中的那个会漏判 trial。
+# --------------------------------------------------------------------------- #
+
+
+def test_both_windows_are_kept_when_they_differ(entry: SongEntry) -> None:
+    """两个来源给的区间不一致时, 两个都要留着."""
+    entry.try_begin_ms, entry.try_end_ms = 84346, 142843
+    entry.vi = [0, 0, 0, 0, 84346, 114346]
+    windows = entry.trial_windows
+    assert len(windows) == 2
+    assert (84346, 142843, "file.try_begin/try_end") in windows
+    assert (84346, 114346, "vi[4]/vi[5]") in windows
+
+
+def test_identical_windows_are_deduped(entry: SongEntry) -> None:
+    """两个来源一致时不重复记录."""
+    entry.try_begin_ms, entry.try_end_ms = 60000, 90000
+    entry.vi = [0, 0, 0, 0, 60000, 90000]
+    assert len(entry.trial_windows) == 1
+
+
+def test_duration_matching_the_non_preferred_window_is_still_trial(entry: SongEntry) -> None:
+    """实际时长命中 vi 那个区间 —— 即使 file 是首选, 也必须判 trial.
+
+    这是「并列候选」的核心: 只比对 file 会把 30s 的试听片段放行。
+    """
+    entry.interval = 269
+    entry.try_begin_ms, entry.try_end_ms = 84346, 142843   # 58.5s（首选）
+    entry.vi = [0, 0, 0, 0, 84346, 114346]                 # 30s（次选）
+
+    result = verify.check_duration(entry, 30.0)
+    assert result.verdict is verify.Verdict.TRIAL
+    assert "vi[4]/vi[5]" in result.detail
+
+
+def test_duration_matching_the_preferred_window_is_trial(entry: SongEntry) -> None:
+    """命中 file 那个区间同样判 trial."""
+    entry.interval = 269
+    entry.try_begin_ms, entry.try_end_ms = 84346, 142843
+    entry.vi = [0, 0, 0, 0, 84346, 114346]
+
+    result = verify.check_duration(entry, 58.5)
+    assert result.verdict is verify.Verdict.TRIAL
+    assert "file.try_begin/try_end" in result.detail
+
+
+def test_full_length_not_flagged_even_with_two_windows(entry: SongEntry) -> None:
+    """完整时长不能因为存在两个窗口就被误判."""
+    entry.interval = 269
+    entry.try_begin_ms, entry.try_end_ms = 84346, 142843
+    entry.vi = [0, 0, 0, 0, 84346, 114346]
+    assert verify.check_duration(entry, 269.0).ok
+
+
+def test_window_covering_whole_song_is_ignored(entry: SongEntry) -> None:
+    """「试听窗口」几乎等于整首歌时, 比对没有意义, 不能拿它判 trial."""
+    entry.interval = 60
+    entry.try_begin_ms, entry.try_end_ms = 0, 60000
+    entry.vi = []
+    assert verify.check_duration(entry, 60.0).ok
 
 
 # --------------------------------------------------------------------------- #
@@ -120,8 +187,8 @@ def test_short_duration_is_trial(entry: SongEntry) -> None:
     result = verify.check_duration(entry, 30.0)
     assert result.verdict is verify.Verdict.TRIAL
     assert result.reason == TrialReason.DURATION_SHORT.value
-    # 落在 try_end - try_begin 附近时要点出来
-    assert "试听时长" in result.detail
+    # 命中试听窗口时要把是哪个窗口点出来
+    assert "试听窗口" in result.detail
 
 
 def test_full_duration_passes(entry: SongEntry) -> None:

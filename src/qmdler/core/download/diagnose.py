@@ -85,9 +85,12 @@ class SingleDiagnosis:
     size_delta_pct: float | None = None
     downloaded_bytes: int = 0
     actual_duration: float = 0.0
-    #: 试听窗口取自 ``file.try_begin/try_end`` 还是 ``vi[4]/vi[5]``.
+    #: 展示用的默认窗口来源 (``file`` 优先).
     trial_window_source: str = ""
     trial_window_ms: tuple[int, int] = (0, 0)
+    #: **全部**已知试听窗口 ``[(开始ms, 结束ms, 来源)]`` —— 两者是并列候选,
+    #: 第 4 层会逐个比对, 不只看被选中的那个.
+    trial_windows: list[tuple[int, int, str]] = field(default_factory=list)
     size_try: int = 0
     layers: list[LayerResult] = field(default_factory=list)
     verdict: str = ""
@@ -127,6 +130,10 @@ class SingleDiagnosis:
             "actual_duration": self.actual_duration,
             "trial_window_source": self.trial_window_source,
             "trial_window_ms": list(self.trial_window_ms),
+            "trial_windows": [
+                {"begin_ms": begin, "end_ms": end, "seconds": round((end - begin) / 1000, 1), "source": source}
+                for begin, end, source in self.trial_windows
+            ],
             "size_try": self.size_try,
             "layers": [layer.as_dict() for layer in self.layers],
             "verdict": self.verdict,

@@ -362,8 +362,12 @@ def _print_diagnosis(payload: dict) -> None:
             console.print(f"           说明: {layer['detail']}")
     console.print()
 
-    console.print(f"  试听窗口: {payload['trial_window_ms']} ms  取自 [cyan]{payload['trial_window_source']}[/cyan]"
-                  f"  size_try={payload['size_try']}")
+    console.print(f"  试听窗口（全部候选，第 4 层逐个比对）  size_try={payload['size_try']}")
+    for window in payload["trial_windows"]:
+        console.print(f"    · {window['begin_ms']}~{window['end_ms']}ms "
+                      f"（{window['seconds']}s，取自 [cyan]{window['source']}[/cyan]）")
+    if not payload["trial_windows"]:
+        console.print("    [dim](该曲目没有试听窗口信息)[/dim]")
     console.print(f"  落盘: {payload['downloaded_bytes']} 字节  时长 {payload['actual_duration']}s")
     console.print()
 

@@ -417,16 +417,38 @@ src/qmdler/
 
 这几条不是文档问题，是只有真跑才会暴露的行为：
 
-- **同一条 `purl` 在多数 CDN 节点上是 403。** dispatch 返回 6 个节点，实测只有
-  `sjy6.stream.qqmusic.qq.com` 放行，其余全部 403 —— 但这 6 个节点的 keepalive 探针
-  （`GetCdnDispatchResponse.test_file`）都返回 200。**403 是「这个节点不给这条链接」，
-  既不是节点挂了，也不是 vkey 过期。** 所以遇到 403 要换节点重试同一条 purl（零额外 API 请求），
-  而不是重新取 vkey（那会把每首歌的接口请求数翻好几倍，正是最该避免的风控特征）。
+- **同一条 `purl` 在多数 CDN 节点上是 403 —— 这不是链接失效，也不是节点故障。**
+  12 首不同的歌，逐节点实测：
+
+  | 节点 | 放行 |
+  |---|---|
+  | `https://sjy6.stream.qqmusic.qq.com/` | 12 / 12 |
+  | `http://sjy6.stream.qqmusic.qq.com/` | 10 / 12 |
+  | `http://aqqmusic.tc.qq.com/` | 0 / 12 |
+  | `https://aqqmusic.tc.qq.com/` | 0 / 12 |
+  | `http://ws.stream.qqmusic.qq.com/` | 0 / 12 |
+  | `http://ws6.stream.qqmusic.qq.com/` | 0 / 12 |
+
+  排除其它解释的依据：keepalive 探针（`GetCdnDispatchResponse.test_file`）6/6 返回 200，
+  排除节点故障；同一条 purl 在放行节点上能稳定下完并逐字节校验通过，排除 vkey 过期。
+
+  **所以遇到 403 要换节点重试同一条 purl（零额外 API 请求），而不是重新取 vkey**
+  —— 后者会把每首歌的接口请求数翻好几倍，正是最该避免的风控特征。
+  这条结论无法从代码推导，已写进 `cdn.py` 的模块 docstring 和 `STALE_LINK_STATUSES`
+  的定义处，避免以后有人顺手把 403 加回去。
+
+- **放行节点在不同 purl 之间是稳定的**，更像客户端/出口 IP 维度的属性，而非
+  (purl, node) 的一次性绑定：随机挑一个的首次命中率 30.6%，固定挑历史最优节点是 100%。
+  因此节点偏好有价值，但实现上必须**可逆**——用「最近一次成功」+「自上次成功以来的
+  连续拒绝数」排序，一次成功即清零，成功记录还会过期。而「这条 purl 被谁拒过」是
+  per-purl 的，换歌即丢，不跨曲目累积。
 - **放行的节点支持 HEAD**，直接 200 并给出准确 `Content-Length`；`Range: bytes=0-0` 退化分支
   也能正常读出 `Content-Range`。两条分支都验证过。
-- **`file.try_begin/try_end` 与 `vi[4]/vi[5]` 会不一致。** 实测某首歌 `file` 给 84346~142843ms（58.5s），
-  `vi` 给 84346~114346ms（30s），而实际试听文件按码率折算约 60s —— 与 `file` 吻合。
-  所以试听窗口优先取 `file`、回退 `vi` 是有实测依据的。
+- **`file.try_begin/try_end` 与 `vi[4]/vi[5]` 会不一致，而且它们是并列候选而非主备。**
+  实测某首歌 `file` 给 84346~142843ms（58.5s），`vi` 给 84346~114346ms（30s）。
+  差距太大，不像取整误差，更像是不同档位各有各的试听区间。
+  因此两个区间**全部记录**，第 4 层时长校验**逐个比对，命中任意一个即判 `trial`**——
+  `file` 优先只用于展示与默认值，不作为判定时的排他选择。漏判 trial 正是这个项目最怕的方向。
 - **`GetCdnDispatchResponse.test_file` 是一条完整带 `vkey`/`guid` 的 URL**，不是路径。
   做日志脱敏和响应快照时别漏了它。
 | `get_song_urls` 超过 100 mid 抛 `ValueError` | 常量定义了但函数体里没有校验 | 自行分批 |

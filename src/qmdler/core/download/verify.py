@@ -110,8 +110,12 @@ def check_trial_size(entry: SongEntry, content_length: int, *, tolerance: float 
         return OK
     delta = abs(content_length - entry.size_try) / entry.size_try
     if delta <= tolerance:
-        begin, end = entry.trial_window_ms
-        window = f"，试听区间 {begin}~{end}ms" if end > begin else ""
+        windows = entry.trial_windows
+        window = (
+            "，试听区间 " + "、".join(f"{begin}~{end}ms（{source}）" for begin, end, source in windows)
+            if windows
+            else ""
+        )
         return VerifyResult(
             Verdict.TRIAL,
             TrialReason.SIZE_TRY_MATCH.value,
@@ -148,24 +152,53 @@ def check_size(expected_size: int, actual_size: int, *, tolerance: float = 0.02)
 def check_duration(entry: SongEntry, actual_seconds: float, *, tolerance: float = 0.9) -> VerifyResult:
     """第 4 层: 实际时长 vs ``track.interval``.
 
-    比 ``interval`` 短一大截 (尤其落在 ``try_end - try_begin`` 附近) 即为试听片段.
+    比 ``interval`` 短一大截即为试听片段.
+
+    与试听窗口比对时**逐个比对全部已知窗口** (``file.try_begin/try_end`` 与
+    ``vi[4]/vi[5]`` 是并列候选, 不是主备), 命中任意一个都要点出来 —— 只比对
+    被选中的那一个会漏判.
     """
     expected = entry.interval
     if expected <= 0 or actual_seconds <= 0:
         return OK
+
+    # 只要与任意一个试听窗口的时长吻合, 就算 interval 比对还没到阈值也判 trial:
+    # 漏判 trial 的代价远高于误判.
+    matched = _matching_trial_window(entry, actual_seconds)
+    if matched is not None:
+        begin, end, source = matched
+        return VerifyResult(
+            Verdict.TRIAL,
+            TrialReason.DURATION_SHORT.value,
+            f"实际时长 {actual_seconds:.0f}s 与试听窗口 {begin}~{end}ms"
+            f"（{(end - begin) / 1000:.0f}s，取自 {source}）吻合，应为 {expected}s",
+        )
+
     if actual_seconds >= expected * tolerance:
         return OK
 
-    begin, end = entry.trial_window_ms
-    trial_seconds = (end - begin) / 1000 if end > begin else 0
-    hint = ""
-    if trial_seconds > 0 and abs(actual_seconds - trial_seconds) <= max(3.0, trial_seconds * 0.1):
-        hint = f"，且与试听时长 {trial_seconds:.0f}s 吻合"
     return VerifyResult(
         Verdict.TRIAL,
         TrialReason.DURATION_SHORT.value,
-        f"实际时长 {actual_seconds:.0f}s，应为 {expected}s{hint}",
+        f"实际时长 {actual_seconds:.0f}s，应为 {expected}s",
     )
+
+
+def _matching_trial_window(entry: SongEntry, actual_seconds: float) -> tuple[int, int, str] | None:
+    """实际时长命中了哪个试听窗口 (逐个比对, 不只看被选中的那个)."""
+    if actual_seconds <= 0:
+        return None
+    # 完整曲目的时长本身就短于任何窗口时不作数.
+    for begin, end, source in entry.trial_windows:
+        trial_seconds = (end - begin) / 1000
+        if trial_seconds <= 0:
+            continue
+        if entry.interval > 0 and trial_seconds >= entry.interval * 0.95:
+            # 「试听窗口」几乎等于整首歌, 比对没有意义.
+            continue
+        if abs(actual_seconds - trial_seconds) <= max(3.0, trial_seconds * 0.1):
+            return begin, end, source
+    return None
 
 
 def combine(*results: VerifyResult) -> VerifyResult:

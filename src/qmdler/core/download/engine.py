@@ -121,6 +121,9 @@ class DownloadEngine:
         #: 最近一次探测结果与逐节点尝试记录, 供 ``--single`` 诊断输出.
         self._last_probe = fetcher.ProbeResult()
         self._last_probe_attempts: list[str] = []
+        #: 「本条 purl 已被哪些节点拒过」—— 键是 purl, 每首歌处理完即清空.
+        #: 绝不能把它攒到节点上跨曲目累积.
+        self._purl_rejections: dict[str, set[str]] = {}
         #: ``--single`` 诊断记录; 为 None 表示不在诊断模式.
         self._diagnosis: SingleDiagnosis | None = None
         #: 诊断模式下跳过下载间隔.
@@ -283,6 +286,9 @@ class DownloadEngine:
         self._state.phase = "preparing"
         self._emit_state()
 
+        # 上一首的 purl 拒绝记录到此为止, 不跨曲目累积.
+        self._purl_rejections.clear()
+
         chain = task.quality_chain or self._settings.quality.chain
         plan = build_plan(entry, chain, on_all_unavailable=self._settings.quality.on_all_unavailable)
 
@@ -303,6 +309,7 @@ class DownloadEngine:
             self._diagnosis.size_try = entry.size_try
             self._diagnosis.trial_window_ms = (begin, end)
             self._diagnosis.trial_window_source = source
+            self._diagnosis.trial_windows = list(entry.trial_windows)
 
         if not plan.available:
             await self._set_item(
@@ -607,8 +614,10 @@ class DownloadEngine:
                 LayerResult(
                     name="第2层 size_try 交叉验证",
                     observed=f"探到 {content_length} 字节",
-                    expected=f"size_try={entry.size_try}，试听窗口 {self._diagnosis.trial_window_ms}"
-                    f"（取自 {self._diagnosis.trial_window_source}）",
+                    expected=f"size_try={entry.size_try}，试听窗口 "
+                    + "、".join(
+                        f"{b}~{e}ms（{src}）" for b, e, src in self._diagnosis.trial_windows
+                    ),
                     verdict=pre_checks[1].verdict.value,
                     detail=pre_checks[1].detail,
                 ),
@@ -796,20 +805,27 @@ class DownloadEngine:
         探测本身就是第 3 层校验的前置 HEAD/Range, 所以这里顺带把长度也拿回来,
         不额外多打一次请求.
 
+        「已经拒过这条 purl 的节点」记在 :attr:`_purl_rejections` 里, 键是 purl,
+        换歌就丢 —— 不跨曲目累积. 节点级只留连通性与「最近是否成功过」.
+
         Returns:
             ``(节点, 完整 URL, 探测结果)``; 全部拒绝时节点为 ``None``.
         """
+        rejected_for_purl = self._purl_rejections.setdefault(purl, set())
+        if skip is not None:
+            rejected_for_purl.add(skip.base)
+
         attempts: list[str] = []
-        for node in await self._cdn.candidates():
-            if skip is not None and node.base == skip.base:
-                continue
+        for node in await self._cdn.candidates(exclude=rejected_for_purl):
             url = self._cdn.join(node, purl)
             result = await fetcher.probe(self._http, url)
             attempts.append(f"{node.base}→{result.method}/{result.status_code}")
             if result.rejected:
+                rejected_for_purl.add(node.base)
                 self._cdn.report_rejection(node)
                 continue
             if result.method == "failed":
+                rejected_for_purl.add(node.base)
                 self._cdn.report_failure(node)
                 continue
             self._last_probe_attempts = attempts
