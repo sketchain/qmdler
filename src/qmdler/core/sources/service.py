@@ -3,7 +3,10 @@
 八种来源统一产出 ``list[SongEntry]``.
 
 **分页必须翻完**, 但必须带 limit: 这些接口都是 ``ItemPaginatedCgiRequest``,
-``.collect_items(limit=N)`` 会自动跨页展开, 不设 limit 就是无限拉.
+库自带的跨页展开不设 limit 就是无限拉.
+
+翻页一律走 :meth:`SourceService._paginate` —— 它在页与页之间插限速、支持取消、
+每页推进度. 库自带的那个一次性收集器会把几十页**背靠背**打完, 不要直接用.
 
 **关于 query_song**: 列表接口返回的已经是完整的 ``Song`` 对象 —— ``Song.file`` /
 ``Song.pay`` 在模型上是必填字段, 所以 ``size_*`` / ``media_mid`` / ``interval`` /
@@ -38,13 +41,20 @@ logger = logging.getLogger(__name__)
 #: 所以我们自己分批.
 QUERY_SONG_MAX_MIDS = 100
 
-#: 各来源的默认拉取上限. 超过 1000 首的歌单不能只拿第一页, 但也不能无限拉.
+#: 各来源的拉取上限. 不能只拿第一页, 但也不能无限拉.
 #:
-#: ⚠️ 这个值**会截断**: 实测有 5075 首的收藏歌单, 默认 2000 就只能拿到前 2000.
-#: 截断本身是有意的 (无限拉是更糟的默认值), 但必须**说出来** —— 所以
-#: :class:`SourceResult` 带 ``truncated`` 与真实 ``total``, 两个前端都要显示.
-#: 需要全量时由调用方显式传更大的 limit (REST 上限 10000).
-DEFAULT_LIMIT = 2000
+#: **默认值即上限**, 两者是同一个常量 —— REST 的 ``Field(default=…, le=…)``
+#: 直接引用它, 不在两处各写一个数.
+#:
+#: 为什么是 10000 而不是更小: 这个工具就是给歌单批量归档用的, 五千首级别的
+#: 歌单不罕见 (实测的收藏歌单就有 5075 首). 默认吃不下, 主要场景就不成立.
+#: 而截断的代价是**用户以为下完了整个歌单, 实际少了几千首, 可能几个月后才发现**——
+#: 这比"误点一次多翻几十页"严重得多, 何况翻页已经带限速 (5000 首约 80 秒)
+#: 且随时可以取消.
+#:
+#: ⚠️ 即便 10000 也仍可能被更大的歌单撑爆, 所以 :class:`SourceResult` 的
+#: ``truncated`` 与真实 ``total`` 必须保留, 两个前端都要**常驻**显示.
+DEFAULT_LIMIT = 10000
 
 #: 每页条数. 太小会翻很多页 (每页一次请求), 太大容易被判异常.
 PAGE_SIZE = 100
@@ -107,8 +117,17 @@ class SourceService:
     # -- 取消 ---------------------------------------------------------------- #
 
     def cancel_fetch(self) -> None:
-        """请求取消当前的拉取. 下一个翻页检查点生效."""
+        """请求取消当前的拉取. 下一个翻页检查点生效.
+
+        **要广播** —— 「任一端的操作对另一端立即可见」也包括这个: 不推的话
+        另一端还停在「正在拉取…」上干等.
+
+        ⚠️ 取消是**服务级**的: 两个前端同时在拉时, 任何一端点取消都会把两边
+        都掐掉. 本工具是单用户本地服务, 这个取舍可以接受, 但别当成没有.
+        """
         self._cancel_requested = True
+        if self._bus is not None:
+            self._bus.emit(EventKind.SOURCE_PROGRESS, {"cancelled": True, "done": True})
 
     def _check_cancelled(self) -> None:
         if self._cancel_requested:
@@ -177,10 +196,17 @@ class SourceService:
         ]
 
     async def fav_songlists(self, limit: int = 200) -> list[dict[str, Any]]:
-        """账号收藏的他人歌单. 需要 euin."""
+        """账号收藏的他人歌单. 需要 euin.
+
+        走 :meth:`_paginate` 而不是 ``collect_items`` —— 后者会把几页背靠背打完,
+        与其它来源不一致. 页数少不是免限速的理由.
+        """
         euin = await self._require_euin()
         request = self._client.user.get_fav_songlist(euin, page=1, num=PAGE_SIZE)
-        items = await request.collect_items(limit=limit)
+        items = [
+            item
+            async for item in self._paginate(request, limit=limit, kind="fav_songlist", name="收藏歌单")
+        ]
         return [
             {
                 "id": item.id,

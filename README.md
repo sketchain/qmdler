@@ -232,7 +232,18 @@ QMDLER_DOWNLOAD__INTERVAL_SECONDS=240
 QMDLER_QUALITY__REJECT_TRIAL=true
 ```
 
-优先级：内置默认 < TOML 文件 < 选中的预设 < 环境变量。
+优先级：**内置默认 < TOML 文件 < 环境变量**。
+
+> 这条曾经只写在文档里、实现是反的：pydantic-settings 的默认源顺序是
+> `init → env → …` 且**靠前的赢**，于是 `Settings(**file_data)` 里的文件值会盖住
+> 环境变量。实测 `QMDLER_DOWNLOAD__INTERVAL_SECONDS=99` 配文件里的 `7`，拿到的是 7 ——
+> 容器里靠环境变量覆盖的用法完全不生效。现在通过 `settings_customise_sources`
+> 把 `env` 排到 `init` 前面，用例钉住。
+
+**预设不在这条链上。** 它是「一次性把一批值写进配置文件」，不是运行时叠加层：
+切换预设会把预设的值合并进文件再落盘，之后 `preset` 只是个标签。
+这样「一键切换」照常工作，而且**之后你在设置界面改动这些字段不会被预设盖回去** ——
+旧实现是运行时叠加，改完当次生效、重启后悄悄弹回预设的值，完全看不出为什么。
 
 ### 配置预设
 

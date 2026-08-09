@@ -529,7 +529,12 @@ class QmdlerApp(App[None]):
     async def _fetch(self, source_type: str, identifier: str) -> None:
         self._write_log(f"正在拉取 {source_type} …")
         result = await self.api.fetch_source(
-            {"source_type": source_type, "identifier": identifier, "limit": 2000},
+            {
+                "source_type": source_type,
+                "identifier": identifier,
+                # 上限只有后端一个来源，TUI 不写死（见 config 的 limits）。
+                "limit": ((self._config.get("limits") or {}).get("fetch_default") or 10000),
+            },
         )
         self._source_items = result["items"]
         self._source_meta = result

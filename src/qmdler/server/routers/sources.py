@@ -23,7 +23,8 @@ class FetchRequest(BaseModel):
     source_type: Literal["created", "fav_songlist", "fav_song", "songlist", "album", "singer", "search", "manual"]
     identifier: str = ""
     #: 分页必须翻完, 但必须有上限, 别无限拉.
-    limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=10000)
+    #: 默认值与上限是**同一个常量**, 不在这里另写一个数.
+    limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=DEFAULT_LIMIT)
     name: str = ""
 
 

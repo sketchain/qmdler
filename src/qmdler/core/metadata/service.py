@@ -80,7 +80,7 @@ class MetadataService:
         self._client = client
         self._http = http
         self._config = download_config
-        self._cover = CoverFetcher(http)
+        self._cover = CoverFetcher(http, delay=self._delay)
         #: album_mid → 流派文本. 整张专辑只请求一次.
         self._genre_cache: dict[str, str] = {}
 

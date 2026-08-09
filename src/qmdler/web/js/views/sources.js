@@ -3,7 +3,7 @@
 import { api } from '../api.js';
 import { store, toast } from '../store.js';
 
-const { reactive, onMounted } = Vue;
+const { reactive, computed, watch, onMounted } = Vue;
 
 export const SourcesView = {
   name: 'SourcesView',
@@ -11,7 +11,8 @@ export const SourcesView = {
     const state = reactive({
       tab: 'created',
       input: '',
-      limit: 2000,
+      // 默认值从后端读（store.settings.limits），这里只是它到位前的占位。
+      limit: 0,
       loading: false,
     });
 
@@ -77,7 +78,15 @@ export const SourcesView = {
       if (store.auth.logged_in) loadCreated();
     });
 
-    return { state, store, loadCreated, loadFav, fetchSource, fetchFromInput };
+    // 上限只有后端一个来源，前端不写死。
+    const fetchMax = computed(() => (store.settings?.limits?.fetch_max) || 10000);
+    watch(
+      () => store.settings?.limits?.fetch_default,
+      (value) => { if (value && !state.limit) state.limit = value; },
+      { immediate: true },
+    );
+
+    return { state, store, loadCreated, loadFav, fetchSource, fetchFromInput, fetchMax };
   },
   template: `
     <div>
@@ -92,7 +101,7 @@ export const SourcesView = {
 
       <div class="field">
         <label>拉取上限（分页会自动翻完，但不会无限拉）</label>
-        <input type="number" v-model.number="state.limit" min="1" max="10000" />
+        <input type="number" v-model.number="state.limit" min="1" :max="fetchMax" />
       </div>
 
       <button class="btn--sm" style="width:100%;margin-bottom:10px" @click="fetchSource('fav_song','', '我喜欢')" :disabled="!store.auth.logged_in">
