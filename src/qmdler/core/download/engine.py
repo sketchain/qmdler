@@ -38,6 +38,7 @@ from ..models import (
     TaskStatus,
     quality_extension,
     quality_label,
+    quality_start_code,
 )
 from ..naming.sanitize import dedupe_path
 from ..naming.template import RenderContext, TemplateRenderer
@@ -46,6 +47,7 @@ from ..sources.service import SourceService
 from ..storage.repository import Repository
 from . import fetcher, verify
 from .cdn import CdnManager
+from .diagnose import LayerResult, SingleDiagnosis, safe_purl
 from .errors import Action, classify, classify_result_code
 from .ratelimit import IntervalWaiter
 from .state import ActionOutcome, is_complete, resolve_action, summarize
@@ -116,6 +118,19 @@ class DownloadEngine:
         self._pause_requested = False
         self._cancel_requested = False
         self._state = EngineState()
+        #: 最近一次探测结果与逐节点尝试记录, 供 ``--single`` 诊断输出.
+        self._last_probe = fetcher.ProbeResult()
+        self._last_probe_attempts: list[str] = []
+        #: ``--single`` 诊断记录; 为 None 表示不在诊断模式.
+        self._diagnosis: SingleDiagnosis | None = None
+        #: 诊断模式下跳过下载间隔.
+        self._skip_intervals = False
+
+    def enable_diagnosis(self) -> SingleDiagnosis:
+        """打开 ``--single`` 诊断模式: 记录四层校验的每一个实际判定值, 并跳过间隔."""
+        self._diagnosis = SingleDiagnosis()
+        self._skip_intervals = True
+        return self._diagnosis
 
     # -- 对外控制 ------------------------------------------------------------ #
 
@@ -221,8 +236,8 @@ class DownloadEngine:
                     await self._finish_task(task.id, TaskStatus.COMPLETED, "")
                     return
 
-                # 间隔: 第一首不等.
-                if not first:
+                # 间隔: 第一首不等; 诊断模式一律不等.
+                if not first and not self._skip_intervals:
                     self._state.phase = "waiting"
                     self._emit_state()
                     await self._waiter.wait()
@@ -270,6 +285,24 @@ class DownloadEngine:
 
         chain = task.quality_chain or self._settings.quality.chain
         plan = build_plan(entry, chain, on_all_unavailable=self._settings.quality.on_all_unavailable)
+
+        if self._diagnosis is not None:
+            begin, end, source = entry.trial_window_with_source
+            self._diagnosis.songmid = entry.songmid
+            self._diagnosis.title = entry.title
+            self._diagnosis.singers = "、".join(entry.singer_names)
+            self._diagnosis.interval = entry.interval
+            # sa 只记录不解读: 位布局无文档, 攒实测标定素材用.
+            self._diagnosis.sa = entry.sa
+            self._diagnosis.status_code = entry.status
+            self._diagnosis.pay = dict(entry.pay)
+            self._diagnosis.available_qualities = dict(entry.available_qualities)
+            self._diagnosis.quality_chain = list(chain)
+            self._diagnosis.requested_quality = plan.requested
+            self._diagnosis.requested_start_code = quality_start_code(plan.requested) if plan.requested else ""
+            self._diagnosis.size_try = entry.size_try
+            self._diagnosis.trial_window_ms = (begin, end)
+            self._diagnosis.trial_window_source = source
 
         if not plan.available:
             await self._set_item(
@@ -393,6 +426,19 @@ class DownloadEngine:
                 continue
             if not candidate.usable:
                 decision = classify_result_code(candidate.result)
+                if self._diagnosis is not None:
+                    # 拿不到 purl 也要记下来 —— 「为什么这首下不了」全靠这个 result。
+                    self._diagnosis.attempted_quality = quality
+                    self._diagnosis.result_code = candidate.result
+                    self._diagnosis.add(
+                        LayerResult(
+                            name="取链",
+                            observed=f"{quality_label(quality)} result={candidate.result}",
+                            expected="result=0 且 purl 非空",
+                            verdict="failed",
+                            detail=decision.message,
+                        ),
+                    )
                 if decision.action is Action.PAUSE_TASK:
                     self._state.pause_reason = decision.message
                     await self._set_item(
@@ -408,6 +454,23 @@ class DownloadEngine:
 
             # 第 1 层: filename 前缀比对.
             prefix_result = verify.check_prefix(quality, candidate.purl, candidate.filename)
+            if self._diagnosis is not None:
+                self._diagnosis.attempted_quality = quality
+                self._diagnosis.result_code = candidate.result
+                self._diagnosis.purl_filename = safe_purl(candidate.purl)
+                self._diagnosis.prefix_source = "purl" if verify.extract_prefix(candidate.purl) else "filename"
+                self._diagnosis.extracted_prefix = prefix_result.actual_prefix or verify.extract_prefix(
+                    candidate.purl,
+                ) or verify.extract_prefix(candidate.filename)
+                self._diagnosis.add(
+                    LayerResult(
+                        name="第1层 filename 前缀",
+                        observed=f"{self._diagnosis.extracted_prefix}（取自 {self._diagnosis.prefix_source}）",
+                        expected=quality_start_code(quality),
+                        verdict=prefix_result.verdict.value,
+                        detail=prefix_result.detail,
+                    ),
+                )
             if prefix_result.verdict is verify.Verdict.TRIAL and self._settings.quality.reject_trial:
                 rejected.append(f"{quality_label(quality)}: {prefix_result.detail}")
                 self._bus.log(
@@ -494,13 +557,42 @@ class DownloadEngine:
 
         expected_size = entry.available_qualities.get(quality, 0)
 
-        node = await self._cdn.pick()
-        url = self._cdn.join(node, candidate.purl)
-
-        # 第 3 层 (前置): HEAD/Range 探 Content-Length, 不合再下就是浪费 3 分钟.
+        # 选节点: 同一条 purl 依次换节点试, 不为 403 去重新取 vkey.
+        # 实测同一条 purl 在 6 个节点里往往只有 1 个放行, 其余全 403,
+        # 而所有节点的 keepalive 探针都是 200 —— 403 是节点不给这条链接,
+        # 不是链接失效.
         self._state.phase = "probing"
         self._emit_state()
-        content_length = await fetcher.probe_content_length(self._http, url)
+        node, url, probe_result = await self._select_node(candidate.purl, task=task, item=item)
+        if node is None:
+            self._bus.log(
+                f"{entry.title}：全部 {len(await self._cdn.candidates())} 个 CDN 节点都拒绝了这条链接，重新取 vkey",
+                level="warning",
+                task_id=task.id,
+                item_id=item.id,
+            )
+            credential = await self._auth.get_valid_credential()
+            fresh = await fetcher.fetch_urls(self._client, entry, [quality], credential=credential)
+            if not fresh or not fresh[0].usable:
+                return "retry_next"
+            node, url, probe_result = await self._select_node(fresh[0].purl, task=task, item=item)
+            if node is None:
+                return "retry_next"
+
+        content_length = probe_result.length
+        self._last_probe = probe_result
+
+        if self._diagnosis is not None:
+            self._diagnosis.cdn_attempts = list(self._last_probe_attempts)
+            self._diagnosis.cdn_used = node.base if node is not None else ""
+            self._diagnosis.probe_method = probe_result.method
+            self._diagnosis.probe_status = probe_result.status_code
+            self._diagnosis.content_length = content_length
+            self._diagnosis.expected_size = expected_size
+            if expected_size and content_length:
+                self._diagnosis.size_delta_pct = round(
+                    abs(content_length - expected_size) / expected_size * 100, 3,
+                )
 
         pre_checks = [
             prefix_result,
@@ -508,6 +600,28 @@ class DownloadEngine:
             verify.check_size(expected_size, content_length, tolerance=settings.quality.size_tolerance),
         ]
         pre_result = verify.combine(*pre_checks)
+        if self._diagnosis is not None:
+            delta = self._diagnosis.size_delta_pct
+            delta_note = f"差异 {delta}%" if delta is not None else ""
+            self._diagnosis.add(
+                LayerResult(
+                    name="第2层 size_try 交叉验证",
+                    observed=f"探到 {content_length} 字节",
+                    expected=f"size_try={entry.size_try}，试听窗口 {self._diagnosis.trial_window_ms}"
+                    f"（取自 {self._diagnosis.trial_window_source}）",
+                    verdict=pre_checks[1].verdict.value,
+                    detail=pre_checks[1].detail,
+                ),
+            )
+            self._diagnosis.add(
+                LayerResult(
+                    name="第3层 Content-Length vs size_*（下载前）",
+                    observed=f"{content_length} 字节（{probe_result.method} 分支，HTTP {probe_result.status_code}）",
+                    expected=f"{expected_size} 字节",
+                    verdict=pre_checks[2].verdict.value,
+                    detail=pre_checks[2].detail or delta_note,
+                ),
+            )
         if pre_result.verdict is verify.Verdict.TRIAL and settings.quality.reject_trial:
             self._bus.log(
                 f"{entry.title}：下载前检出试听（{pre_result.detail}），跳过该档位",
@@ -541,8 +655,29 @@ class DownloadEngine:
                 on_progress=on_progress,
                 cancelled=lambda: self._cancel_requested,
             )
+        except fetcher.CdnRejectedError as exc:
+            # 下到一半节点翻脸 (403/5xx): 换节点用同一条 purl 续传, 不重新取 vkey.
+            self._bus.log(
+                f"{entry.title}：CDN 中途拒绝（{exc}），换节点续传",
+                level="info",
+                task_id=task.id,
+                item_id=item.id,
+            )
+            node, url, _ = await self._select_node(candidate.purl, task=task, item=item, skip=node)
+            if node is None:
+                raise
+            outcome = await fetcher.download_file(
+                self._http,
+                url,
+                target,
+                node=node,
+                cdn=self._cdn,
+                expected_size=expected_size,
+                on_progress=on_progress,
+                cancelled=lambda: self._cancel_requested,
+            )
         except fetcher.LinkExpiredError:
-            # 403 / 链接失效: 重新取一次 vkey 续传, 不计入失败次数.
+            # 404/410: 链接是真没了, 这时才值得重新取一次 vkey 续传.
             self._bus.log(
                 f"{entry.title}：下载链接失效，重新取 vkey 续传",
                 level="info",
@@ -553,8 +688,9 @@ class DownloadEngine:
             fresh = await fetcher.fetch_urls(self._client, entry, [quality], credential=credential)
             if not fresh or not fresh[0].usable:
                 raise
-            node = await self._cdn.pick()
-            url = self._cdn.join(node, fresh[0].purl)
+            node, url, _ = await self._select_node(fresh[0].purl, task=task, item=item)
+            if node is None:
+                raise
             outcome = await fetcher.download_file(
                 self._http,
                 url,
@@ -578,6 +714,33 @@ class DownloadEngine:
                 tolerance=settings.quality.duration_tolerance,
             ),
         )
+
+        if self._diagnosis is not None:
+            duration = detect_duration(outcome.path)
+            self._diagnosis.downloaded_bytes = outcome.bytes_written
+            self._diagnosis.actual_duration = round(duration, 2)
+            self._diagnosis.add(
+                LayerResult(
+                    name="第3层 实际字节数 vs size_*（落盘后）",
+                    observed=f"{outcome.bytes_written} 字节",
+                    expected=f"{expected_size} 字节",
+                    verdict=verify.check_size(
+                        expected_size, outcome.bytes_written, tolerance=settings.quality.size_tolerance,
+                    ).verdict.value,
+                ),
+            )
+            duration_check = verify.check_duration(
+                entry, duration, tolerance=settings.quality.duration_tolerance,
+            )
+            self._diagnosis.add(
+                LayerResult(
+                    name="第4层 实际时长 vs interval",
+                    observed=f"{duration:.1f}s",
+                    expected=f"{entry.interval}s",
+                    verdict=duration_check.verdict.value,
+                    detail=duration_check.detail,
+                ),
+            )
 
         if post_result.verdict is verify.Verdict.TRIAL:
             return await self._handle_trial(task, item, entry, quality, outcome.path, target, post_result)
@@ -619,6 +782,42 @@ class DownloadEngine:
             item_id=item.id,
         )
         return "done"
+
+    async def _select_node(
+        self,
+        purl: str,
+        *,
+        task: TaskRecord,
+        item: ItemRecord,
+        skip: Any = None,
+    ) -> tuple[Any, str, fetcher.ProbeResult]:
+        """依次探测候选节点, 返回第一个愿意服务这条 purl 的.
+
+        探测本身就是第 3 层校验的前置 HEAD/Range, 所以这里顺带把长度也拿回来,
+        不额外多打一次请求.
+
+        Returns:
+            ``(节点, 完整 URL, 探测结果)``; 全部拒绝时节点为 ``None``.
+        """
+        attempts: list[str] = []
+        for node in await self._cdn.candidates():
+            if skip is not None and node.base == skip.base:
+                continue
+            url = self._cdn.join(node, purl)
+            result = await fetcher.probe(self._http, url)
+            attempts.append(f"{node.base}→{result.method}/{result.status_code}")
+            if result.rejected:
+                self._cdn.report_rejection(node)
+                continue
+            if result.method == "failed":
+                self._cdn.report_failure(node)
+                continue
+            self._last_probe_attempts = attempts
+            return node, url, result
+
+        self._last_probe_attempts = attempts
+        logger.info("全部 CDN 节点拒绝该 purl: %s", "; ".join(attempts))
+        return None, "", fetcher.ProbeResult()
 
     async def _handle_trial(
         self,
@@ -751,6 +950,11 @@ class DownloadEngine:
         emit_only: bool = False,
         **fields: Any,
     ) -> None:
+        if self._diagnosis is not None and status is not ItemStatus.DOWNLOADING:
+            self._diagnosis.verdict = status.value
+            self._diagnosis.reason = str(
+                fields.get("error_message") or fields.get("trial_reason") or "",
+            )
         if not emit_only:
             await self._repo.update_item(item.id, status=status, **fields)
         refreshed = await self._repo.get_item(item.id)

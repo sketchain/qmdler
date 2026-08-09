@@ -150,24 +150,37 @@ class LoginScreen(ModalScreen[bool]):
         self._render_qr(result)
 
     def _render_qr(self, payload: dict[str, Any]) -> None:
+        """渲染二维码.
+
+        字符画只是三条出口之一, 而且必须通过自检才画出来 —— 宁可只给地址,
+        也不打印一张可能扫不出来的图.
+        """
         art = self.query_one("#qr-art", Static)
         hint = self.query_one("#qr-hint", Static)
         ascii_art = payload.get("ascii") or ""
+        ascii_error = payload.get("ascii_error") or ""
+        needed = int(payload.get("ascii_width") or 0)
         width = self.size.width
 
-        if not ascii_art:
-            art.update("[yellow]二维码无法在终端渲染，请改用 WebUI。[/yellow]")
-        elif ascii_art and len(ascii_art.splitlines()[0]) > max(20, width - 2):
+        if ascii_error:
+            art.update(f"[yellow]终端二维码不可用：{ascii_error}\n请用下面的地址在浏览器/手机上打开。[/yellow]")
+        elif not ascii_art:
+            art.update("[yellow]终端二维码不可用，请用下面的地址在浏览器/手机上打开。[/yellow]")
+        elif needed > max(20, width - 2):
             art.update(
-                "[yellow]终端太窄，放不下二维码。\n"
-                f"需要约 {len(ascii_art.splitlines()[0])} 列，当前 {width} 列。\n"
-                "请加宽终端，或改用 WebUI / 手机验证码 / 导入凭证。[/yellow]",
+                f"[yellow]终端太窄，放不下二维码（需要 {needed} 列，当前 {width} 列）。\n"
+                "请用下面的地址打开，或加宽终端。[/yellow]",
             )
         else:
             art.update(ascii_art)
 
         status = payload.get("status", "waiting")
-        hint.update(f"{_QR_TEXT.get(status, status)}   （按 R 刷新二维码）")
+        lines = [f"{_QR_TEXT.get(status, status)}   （按 R 刷新二维码）"]
+        for url in payload.get("image_urls") or ([payload["image_url"]] if payload.get("image_url") else []):
+            lines.append(f"  图片地址: {url}")
+        if payload.get("saved_path"):
+            lines.append(f"  已保存到: {payload['saved_path']}")
+        hint.update("\n".join(lines))
 
     def on_login_event(self, payload: dict[str, Any]) -> None:
         """由 App 转发过来的 WS 登录事件."""

@@ -25,6 +25,7 @@ from ..core.download.engine import DownloadEngine
 from ..core.events import EventBus, EventKind
 from ..core.fsutil import expand
 from ..core.metadata.service import MetadataService
+from ..core.netutil import public_bases
 from ..core.sources.service import SourceService
 from ..core.storage.repository import Repository
 
@@ -98,6 +99,11 @@ async def build_context(preset: str | None = None) -> AsyncIterator[AppContext]:
 
     auth = AuthManager(client, credential_store, settings.auth, bus)
     login = LoginCoordinator(client, auth, bus, settings.auth)
+    # 二维码的三条出口: HTTP 图片端点 / 落盘文件 / (诊断模式) 载荷文本。
+    login.configure_endpoint(
+        public_bases(settings.server.host, settings.server.port),
+        paths.state_dir() / "qrcode",
+    )
     sources = SourceService(client, auth, settings.download)
     metadata = MetadataService(client, http, settings.download)
     engine = DownloadEngine(client, auth, repo, bus, settings, metadata, sources, http)

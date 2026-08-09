@@ -31,6 +31,7 @@ from typing import Any, Literal
 from qqmusic_api import Client, Credential
 from qqmusic_api.core.exceptions import LoginError, LoginRateLimitError, NetworkError
 from qqmusic_api.models.login import (
+    QR,
     PhoneLoginEvents,
     QRCodeLoginEvents,
     QRLoginType,
@@ -40,7 +41,7 @@ from qqmusic_api.modules.login_utils import PhoneLoginSession, PollInterval, QRC
 from ..config.schema import AuthConfig
 from ..events import EventBus, EventKind
 from .manager import AuthManager
-from .qrimage import render_terminal_qr
+from .qrimage import art_width, try_render
 from .store import normalize
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,16 @@ class QrLoginState:
     status: QrStatus = "waiting"
     message: str = "正在获取二维码"
     png: bytes = b""
+    mimetype: str = "image/png"
     ascii_art: str = ""
+    #: 字符画还原失败时的原因; 非空表示只能走图片 / 文件 / 载荷这三条路.
+    ascii_error: str = ""
+    #: 图片端点的完整可访问地址 (含实际监听的 IP:端口).
+    image_url: str = ""
+    #: 全部候选地址 (含局域网 IP), 手机要用其中一条.
+    image_urls: list[str] = field(default_factory=list)
+    #: ``QR.save()`` 落盘后的绝对路径.
+    saved_path: str = ""
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
 
@@ -83,9 +93,15 @@ class QrLoginState:
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "has_image": bool(self.png),
+            "mimetype": self.mimetype,
+            "image_url": self.image_url,
+            "image_urls": self.image_urls,
+            "saved_path": self.saved_path,
         }
         if include_ascii:
             payload["ascii"] = self.ascii_art
+            payload["ascii_error"] = self.ascii_error
+            payload["ascii_width"] = art_width(self.ascii_art)
         return payload
 
 
@@ -126,6 +142,42 @@ class LoginCoordinator:
         self._qr: dict[str, QrLoginState] = {}
         self._qr_tasks: dict[str, asyncio.Task[None]] = {}
         self._phone: dict[str, tuple[PhoneLoginState, PhoneLoginSession]] = {}
+        #: 对外可访问的 base 列表（含实际监听的 IP:端口与局域网地址）。
+        self._public_bases: list[str] = []
+        #: 二维码落盘目录。
+        self._qr_dir: Path | None = None
+        #: 最近一次扫码会话，供 ``/api/auth/qrcode.png`` 不带参数时使用。
+        self._latest_qr: str = ""
+
+    def configure_endpoint(self, public_bases: list[str], qr_dir: Path | None = None) -> None:
+        """告诉协调器对外地址与落盘目录.
+
+        地址要含实际监听的 IP:端口 —— TUI/CLI 把它原样打印出来, 人直接用浏览器
+        或手机打开就能扫。
+        """
+        self._public_bases = [base.rstrip("/") for base in public_bases if base]
+        if qr_dir is not None:
+            self._qr_dir = qr_dir
+
+    def note_request_base(self, base: str) -> None:
+        """记下客户端实际用的 base, 排到候选首位 —— 这条一定是通的。"""
+        cleaned = base.rstrip("/")
+        if not cleaned:
+            return
+        if cleaned in self._public_bases:
+            self._public_bases.remove(cleaned)
+        self._public_bases.insert(0, cleaned)
+
+    def _save_qr(self, qrcode: QR) -> str:
+        """落盘一份二维码图片, 返回绝对路径."""
+        if self._qr_dir is None:
+            return ""
+        try:
+            saved = qrcode.save(self._qr_dir)
+        except OSError as exc:
+            logger.warning("二维码落盘失败: %s", exc)
+            return ""
+        return str(saved.resolve()) if saved else ""
 
     # -- 扫码 ---------------------------------------------------------------- #
 
@@ -139,6 +191,7 @@ class LoginCoordinator:
         session_id = uuid.uuid4().hex
         state = QrLoginState(session_id=session_id, login_type=qr_type.value)
         self._qr[session_id] = state
+        self._latest_qr = session_id
 
         session = QRCodeLoginSession(
             self._client.login,
@@ -156,7 +209,12 @@ class LoginCoordinator:
             return state
 
         state.png = qrcode.data
-        state.ascii_art = render_terminal_qr(qrcode.data)
+        state.mimetype = qrcode.mimetype or "image/png"
+        # 字符画只是三条出口之一, 且必须通过自检才输出.
+        state.ascii_art, state.ascii_error = try_render(qrcode.data)
+        state.image_urls = [f"{base}/api/auth/qrcode.png?session_id={session_id}" for base in self._public_bases]
+        state.image_url = state.image_urls[0] if state.image_urls else ""
+        state.saved_path = self._save_qr(qrcode)
         state.expires_at = time.time() + self._config.qrcode_timeout
         state.status = "waiting"
         state.message = f"请使用「{_QR_TYPE_NAMES[qr_type.value]}」扫描二维码"
@@ -225,10 +283,29 @@ class LoginCoordinator:
         """取扫码会话状态."""
         return self._qr.get(session_id)
 
-    def qrcode_image(self, session_id: str) -> bytes:
-        """取二维码图片字节."""
-        state = self._qr.get(session_id)
-        return state.png if state else b""
+    def qrcode_image(self, session_id: str = "") -> tuple[bytes, str]:
+        """取二维码图片字节与 MIME 类型.
+
+        不传 ``session_id`` 时返回最近一次会话的 —— ``/api/auth/qrcode.png``
+        这个「直接用浏览器打开就行」的地址要能免参数访问.
+        """
+        state = self._qr.get(session_id or self._latest_qr)
+        if state is None:
+            return b"", ""
+        return state.png, state.mimetype
+
+    def latest_qrcode(self) -> QrLoginState | None:
+        """最近一次扫码会话."""
+        return self._qr.get(self._latest_qr)
+
+    def decode_payload(self, session_id: str = "") -> tuple[str, str]:
+        """解出二维码载荷 —— 仅诊断用, 依赖 dev 才装的 zxing-cpp."""
+        from .qrpayload import decode_payload
+
+        state = self._qr.get(session_id or self._latest_qr)
+        if state is None or not state.png:
+            return "", "没有可用的二维码会话"
+        return decode_payload(state.png)
 
     # -- 手机号 -------------------------------------------------------------- #
 

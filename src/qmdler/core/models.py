@@ -270,16 +270,27 @@ class SongEntry:
 
     @property
     def trial_window_ms(self) -> tuple[int, int]:
-        """试听片段的 (开始, 结束) 毫秒.
-
-        优先用 ``file.try_begin`` / ``try_end``; 缺失时回退到 ``vi[4]`` / ``vi[5]``,
-        两者互为佐证.
-        """
-        begin, end = self.try_begin_ms, self.try_end_ms
-        if end <= begin:
-            begin = self.vi[4] if len(self.vi) > 4 else 0
-            end = self.vi[5] if len(self.vi) > 5 else 0
+        """试听片段的 (开始, 结束) 毫秒."""
+        begin, end, _ = self.trial_window_with_source
         return begin, end
+
+    @property
+    def trial_window_with_source(self) -> tuple[int, int, str]:
+        """试听窗口及其取值来源.
+
+        优先用 ``file.try_begin`` / ``try_end``; 缺失时回退到 ``vi[4]`` / ``vi[5]``.
+
+        两者**未必一致**: 实测「晴天」给的是 ``file`` 84346~142843ms (58.5s) 而
+        ``vi`` 是 84346~114346ms (30s), 实际试听文件 960887 字节按 128kbps 算
+        约 60s —— 与 ``file`` 吻合. 所以 ``file`` 优先是有实测依据的, 不是随手排的.
+        """
+        if self.try_end_ms > self.try_begin_ms:
+            return self.try_begin_ms, self.try_end_ms, "file.try_begin/try_end"
+        begin = self.vi[4] if len(self.vi) > 4 else 0
+        end = self.vi[5] if len(self.vi) > 5 else 0
+        if end > begin:
+            return begin, end, "vi[4]/vi[5]"
+        return 0, 0, "(无)"
 
     @property
     def replaygain(self) -> tuple[float, float] | None:

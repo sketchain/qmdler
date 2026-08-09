@@ -104,7 +104,13 @@ class EventBus:
         self.publish(Event(kind=kind, payload=payload, task_id=task_id, item_id=item_id, level=level))
 
     def log(self, message: str, *, level: str = "info", task_id: str | None = None, item_id: int | None = None) -> None:
-        """发一条日志事件, 同时写入 Python logging."""
+        """发一条日志事件, 同时写入 Python logging.
+
+        事件也要脱敏 —— 它会经 WS 推到两个前端、还会落进 ``task_events`` 表.
+        """
+        from .redact import redact_text
+
+        message = redact_text(message)
         logger.log(getattr(logging, level.upper(), logging.INFO), message)
         self.emit(EventKind.LOG, {"message": message}, task_id=task_id, item_id=item_id, level=level)
 

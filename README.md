@@ -19,6 +19,7 @@ QQ 音乐歌单批量下载器。**一个核心 + 一个服务 + 两个前端**�
 - [Docker 部署](#docker-部署)
 - [关于音质：请先读这一节](#关于音质请先读这一节)
 - [常见问题](#常见问题)
+- [诊断模式](#诊断模式)
 - [开发](#开发)
 - [与上游库的已知差异](#与上游库的已知差异)
 - [许可证](#许可证)
@@ -71,8 +72,14 @@ qmdler web
 # 启动 TUI（检测不到后端时会自动拉起一个本地服务）
 qmdler tui
 
+# 终端扫码登录（同时给出图片地址、落盘路径、字符画）
+qmdler login --method qq
+
 # 纯 CLI 无人值守
 qmdler download --playlist 7392570702
+
+# 诊断一首歌：跳过间隔，打印四层校验每层的实际判定值
+qmdler single 003w2xz20QlUZt
 ```
 
 三个入口共用同一份配置、同一个数据库、同一套下载逻辑。
@@ -90,6 +97,25 @@ qmdler download --playlist 7392570702
 | **APP 扫码** | 用 QQ 音乐 APP 扫，状态经 MQTT 长连接实时推送 |
 | **手机验证码** | 可能要求先完成人机验证（会给出链接），也可能触发频率限制 |
 | **导入 Credential** | 粘贴 `musicid` / `musickey`，或指定一个 JSON 文件路径 |
+
+### 二维码的三条出口
+
+对着终端字符画扫不方便，所以每次扫码都同时给出三条路，优先级从高到低：
+
+1. **HTTP 图片端点（首选）**：`GET /api/auth/qrcode.png`，直接返回原始图片字节，
+   `Content-Type` 取自 `QR.mimetype`（QQ 是 PNG，微信是 JPEG）。TUI 与 `qmdler login`
+   会把**完整可访问地址**打印出来，包含实际监听的 IP:端口，以及本机的局域网 IP —— 
+   手机连同一个网就能直接打开。不带 `session_id` 时返回最近一次会话的二维码。
+2. **落盘文件**：调 `QR.save()` 存到 `$XDG_STATE_HOME/qmdler/qrcode/`，绝对路径一并打印。
+3. **载荷文本（仅诊断）**：`qmdler login --diagnose` 会用 `zxing-cpp` 解出二维码里的
+   URL 并打印，你可以自己转成更好扫的形式。**`zxing-cpp` 只在 dev 依赖里，运行时代码
+   不依赖它**，没装就打一行安装提示，不影响登录。
+
+字符画本身要过两道自检才会画出来 —— 还原出的模块数必须是 `21+4n`（QR version 1~40 的
+合法边长），左上/右上/左下三个角必须匹配 7×7 定位图案。**任一不过就不画，只给上面三条路**，
+绝不输出一张可能扫不出来的图。中心 logo 照原样画，QR 纠错会兜住。
+
+字符画约需 45 列宽（半块字符纵向已是 1:1，没有再压缩的余地）；终端更窄时直接给地址。
 
 **关于凭证持久化**
 
@@ -130,6 +156,23 @@ QQ 登录要用 `openid` / `access_token` / `expired_at`，少存任何一个下
 
 终端窄于 60 列时（Termux、手机 SSH）自动切成单栏，曲目表只保留「歌名 + 状态 + 进度」，
 侧栏改用 <kbd>F1</kbd>/<kbd>F3</kbd> 全屏切换，不会横向滚动。
+
+### 诊断模式
+
+```bash
+qmdler single 003w2xz20QlUZt            # 人读版
+qmdler single 003w2xz20QlUZt --json     # JSON，方便贴出来
+qmdler single 003w2xz20QlUZt --quality FLAC
+```
+
+只处理一首、跳过下载间隔，把四层校验**每一层的实际判定值**摊开：filename 前缀及其
+取自哪个字段、请求档位编码、`size_*` 期望值、HEAD 还是 Range 分支拿到的 Content-Length
+及差异百分比、逐个 CDN 节点的尝试结果、落盘后解出的时长 vs `interval`、试听窗口取自
+`try_begin/try_end` 还是 `vi[4]/vi[5]`，最后给出 `success` / `trial` / `failed` 及理由。
+另外会打印该曲目的 `sa` 原值（攒实测标定素材用）。
+
+**输出里不会出现凭证、`musickey`、`vkey` 或完整 `purl`** —— `purl` 只打印最后一个路径段。
+真漏了会被自检拦住并拒绝打印。
 
 ### CLI
 
@@ -291,8 +334,13 @@ volumes:
 如果你在前面加了带 `script-src` 严格限制的反向代理 CSP，需要允许 `'unsafe-eval'`：
 Vue 全局构建自带的运行时编译器依赖 `new Function`。自托管直连不受影响。
 
-**Q：TUI 显示不下二维码？**
-二维码需要约 45 列宽。终端更窄时会提示你加宽窗口，或改用 WebUI / 手机验证码 / 导入凭证。
+**Q：TUI 显示不下二维码 / 对着字符画不好扫？**
+每次扫码都会同时给出图片 HTTP 地址（含局域网 IP，手机直接打开）和落盘文件路径，
+见「[二维码的三条出口](#二维码的三条出口)」。字符画只是其中一条，且过不了自检就不画。
+
+**Q：一直提示 CDN 403？**
+正常。实测同一条链接在多数节点上都是 403，只有个别节点放行 —— 程序会自动换节点重试
+同一条链接，不会为此重新取 vkey。`qmdler single` 里能看到逐个节点的尝试结果。
 
 ---
 
@@ -301,10 +349,21 @@ Vue 全局构建自带的运行时编译器依赖 `new Function`。自托管直�
 ```bash
 pip install -e ".[dev]"
 
-pytest              # 177 个测试
+pytest              # 单元 + 集成，全部离线
 ruff check src tests
 mypy
 ```
+
+### 关于测试素材
+
+- `tests/data/qr/` —— 两张**真实**登录二维码（取回两分钟即过期，不含账号信息）。
+  用真图而不是自己生成的，是为了覆盖非整数的每模块像素数、JPEG 噪点、中心 logo
+  这些真实形态。
+- `tests/fixtures/api/` —— **真实 API 响应的脱敏快照，目前刻意空着**。
+  引擎那批 mock 的结构是照着模型定义想出来的，能证明控制流对、证明不了「我们对响应的
+  理解对」。往里塞自己编的 JSON 只是把凭空 mock 换个地方，所以宁可空着让契约测试整体 skip。
+  填充方式见该目录 README，脱敏走 `scripts/redact_snapshot.py`（按键名抹敏感字段、
+  保留结构与类型，落盘前自检有无残留）。
 
 ### 项目结构
 
@@ -324,12 +383,52 @@ src/qmdler/
 
 ## 与上游库的已知差异
 
-基于 `qqmusic-api-python==0.7.2` 实测。以下几处**官方文档与实际源码不一致**，本项目按源码实现：
+基于 `qqmusic-api-python==0.7.2` 实测。
 
-| 官方文档写的 | 0.7.2 实际情况 | 本项目的做法 |
+### 官方文档已过期的地方
+
+上游 docs 站是 mkdocstrings 渲染的 docstring，但 `tutorial/` 下的手写教程没跟上 0.7.x 的重构。
+以下两处**文档里的写法在 0.7.2 中直接不存在**，照抄会 `AttributeError`：
+
+| 官方文档 `tutorial/credential` 写的 | 0.7.2 实际情况 | 正确写法 |
 |---|---|---|
-| `await credential.refresh(client)` | `Credential` 上没有 `refresh` 方法，且 `frozen=True` | 用 `client.login.refresh_credential(cred)`，把返回的新对象回写 `client.credential` |
-| `client.user.get_euin(musicid)` | `UserApi` 上没有这个方法 | euin 取自 `credential.encrypt_uin` |
+| `await credential.refresh(client)` | `Credential` 上根本没有 `refresh` 方法；它是 `frozen=True` 的 pydantic 模型，只有 `is_expired()`，原地改也不可能 | `new = await client.login.refresh_credential(old)`，再把返回的**新对象**回写 `client.credential` |
+| `client.user.get_euin(credential.musicid)` | `UserApi` 上没有 `get_euin`（`dir(UserApi)` 里查无此名） | euin 的唯一来源是登录响应里的 `encryptUin`，即 `credential.encrypt_uin` |
+
+两处均已在 0.7.2 wheel、GitHub `main` 分支源码与运行时 `hasattr` 三重确认。
+
+### 文档与源码都没写、本项目刻意不猜的地方
+
+| 字段 | 情况 | 本项目的做法 |
+|---|---|---|
+| `Song.sa` | docstring 只说「64 位权益位掩码，标识 HQ/SQ/Hi-Res/Atmos/Master 权益及试听状态」，**具体哪一位是什么，源码、docs 站、GitHub main 全都没有** | 原值透传给 UI 展示、`--single` 里原样打印，**不参与任何选档或试听判断**。猜错的后果正好是最怕的两种：能下的歌被静默跳过，或试听被当成完整文件 |
+| `Song.genre` 的 ID 映射 | 注释引用的「文档 5.3.1 映射表」在仓库和文档站里都不存在 | 不臆造映射表，`{流派}` 改走 `album.get_detail()` 返回的流派**文本**，按 `album_mid` 缓存；拿不到就留空 |
+
+`sa` 若要启用，唯一可靠路径是实测标定（取若干组已知状态的曲目做按位交集/差集），
+不是继续找文档。`qmdler single` 会打印 `sa` 原值，就是为了攒这批素材。
+
+### 其它对不上的地方
+
+| 声称 | 实际 |
+|---|---|
+| `get_song_urls` 超过 100 个 mid 抛 `ValueError` | 常量 `_GET_SONG_URLS_MAX_MID = 100` 定义了、docstring 也写了，但函数体里没有任何校验。本项目自行分批 |
+
+### 实测发现（2026-08，未登录取试听档）
+
+这几条不是文档问题，是只有真跑才会暴露的行为：
+
+- **同一条 `purl` 在多数 CDN 节点上是 403。** dispatch 返回 6 个节点，实测只有
+  `sjy6.stream.qqmusic.qq.com` 放行，其余全部 403 —— 但这 6 个节点的 keepalive 探针
+  （`GetCdnDispatchResponse.test_file`）都返回 200。**403 是「这个节点不给这条链接」，
+  既不是节点挂了，也不是 vkey 过期。** 所以遇到 403 要换节点重试同一条 purl（零额外 API 请求），
+  而不是重新取 vkey（那会把每首歌的接口请求数翻好几倍，正是最该避免的风控特征）。
+- **放行的节点支持 HEAD**，直接 200 并给出准确 `Content-Length`；`Range: bytes=0-0` 退化分支
+  也能正常读出 `Content-Range`。两条分支都验证过。
+- **`file.try_begin/try_end` 与 `vi[4]/vi[5]` 会不一致。** 实测某首歌 `file` 给 84346~142843ms（58.5s），
+  `vi` 给 84346~114346ms（30s），而实际试听文件按码率折算约 60s —— 与 `file` 吻合。
+  所以试听窗口优先取 `file`、回退 `vi` 是有实测依据的。
+- **`GetCdnDispatchResponse.test_file` 是一条完整带 `vkey`/`guid` 的 URL**，不是路径。
+  做日志脱敏和响应快照时别漏了它。
 | `get_song_urls` 超过 100 mid 抛 `ValueError` | 常量定义了但函数体里没有校验 | 自行分批 |
 
 另有两处未文档化、本项目**刻意不猜**的字段：
