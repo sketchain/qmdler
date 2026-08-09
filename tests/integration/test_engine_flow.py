@@ -1074,3 +1074,98 @@ async def test_metadata_failure_does_not_fail_the_song(
     assert item.bytes_downloaded == FULL_SIZE
     assert Path(item.target_path).exists(), "音频文件必须留下"
     assert item.lyric_status is SubStatus.FAILED
+
+
+# --------------------------------------------------------------------------- #
+# 翻页: 限速、可取消、不返回半截列表
+#
+# 5075 首的歌单按每页 100 算是 51 次请求。库里的 paginate() 是**连着打**的，
+# 51 次背靠背是很明显的风控特征 —— 所以页与页之间必须插限速。
+# --------------------------------------------------------------------------- #
+
+
+class FakePagedRequest:
+    """ItemPaginatedCgiRequest 替身: 固定页数, 记录每页请求的时刻."""
+
+    def __init__(self, pages: int, per_page: int = 3) -> None:
+        self.pages = pages
+        self.per_page = per_page
+        self.request_times: list[float] = []
+
+    @staticmethod
+    def items_extractor(response: Any) -> Any:
+        return response
+
+    async def paginate(self) -> Any:
+        for page in range(self.pages):
+            # 生成器被 resume 的时刻 = 这一页真正发请求的时刻.
+            self.request_times.append(time.monotonic())
+            yield [f"p{page}i{i}" for i in range(self.per_page)]
+
+
+def make_service(settings: Settings, bus: EventBus) -> Any:
+    from qmdler.core.sources.service import SourceService
+
+    return SourceService(object(), object(), settings.download, bus)  # type: ignore[arg-type]
+
+
+async def test_pagination_is_rate_limited(settings: Settings) -> None:
+    """页与页之间要等, 不能背靠背连打."""
+    settings.download.metadata_delay_min = 0.05
+    settings.download.metadata_delay_max = 0.05
+    service = make_service(settings, EventBus())
+    request = FakePagedRequest(pages=4)
+
+    collected = [item async for item in service._paginate(request, limit=100, kind="t")]
+
+    assert len(collected) == 12
+    gaps = [
+        request.request_times[i + 1] - request.request_times[i]
+        for i in range(len(request.request_times) - 1)
+    ]
+    assert gaps, "至少要翻两页才测得到间隔"
+    assert all(gap >= 0.04 for gap in gaps), f"页与页之间没有限速: {gaps}"
+
+
+async def test_pagination_can_be_cancelled_without_partial_list(settings: Settings) -> None:
+    """取消时抛异常, **不返回半截列表** —— 半截列表看着像完整的, 比拿不到更危险."""
+    settings.download.metadata_delay_min = 0.01
+    settings.download.metadata_delay_max = 0.01
+    service = make_service(settings, EventBus())
+    request = FakePagedRequest(pages=50)
+
+    from qmdler.core.sources.service import FetchCancelledError
+
+    async def collect() -> list[Any]:
+        out = []
+        async for item in service._paginate(request, limit=1000, kind="t"):
+            out.append(item)
+            if len(out) == 6:
+                service.cancel_fetch()
+        return out
+
+    with pytest.raises(FetchCancelledError):
+        await collect()
+    assert len(request.request_times) < 50, "取消之后不该继续翻页"
+
+
+async def test_pagination_emits_progress(settings: Settings) -> None:
+    """每页推一次进度, 否则界面要干等几十秒."""
+    settings.download.metadata_delay_min = 0.0
+    settings.download.metadata_delay_max = 0.0
+    bus = EventBus()
+    service = make_service(settings, bus)
+    request = FakePagedRequest(pages=3)
+
+    seen: list[dict[str, Any]] = []
+    original = bus.emit
+
+    def spy(kind: Any, payload: dict[str, Any], **kwargs: Any) -> Any:
+        seen.append(payload)
+        return original(kind, payload, **kwargs)
+
+    bus.emit = spy  # type: ignore[method-assign]
+    _ = [item async for item in service._paginate(request, limit=100, kind="songlist")]
+
+    assert [payload["loaded"] for payload in seen] == [3, 6, 9], "每翻完一页推一次"
+    assert all(payload["kind"] == "songlist" for payload in seen)

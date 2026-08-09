@@ -104,7 +104,7 @@ async def build_context(preset: str | None = None) -> AsyncIterator[AppContext]:
         public_bases(settings.server.host, settings.server.port),
         paths.state_dir() / "qrcode",
     )
-    sources = SourceService(client, auth, settings.download)
+    sources = SourceService(client, auth, settings.download, bus)
     metadata = MetadataService(client, http, settings.download)
     engine = DownloadEngine(client, auth, repo, bus, settings, metadata, sources, http)
 

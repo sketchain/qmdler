@@ -30,6 +30,8 @@ class EventKind(str, Enum):
     AUTH_STATE = "auth_state"
     LOGIN_EVENT = "login_event"
     CONFIG_CHANGED = "config_changed"
+    #: 拉取歌单来源的进度 (大歌单要翻几十页, 不能让界面干等).
+    SOURCE_PROGRESS = "source_progress"
 
 
 @dataclass(slots=True)

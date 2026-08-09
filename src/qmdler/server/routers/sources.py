@@ -11,7 +11,7 @@ from qqmusic_api.core.exceptions import BaseApiException
 from ...core.auth.manager import NotLoggedInError
 from ...core.quality import annotate
 from ...core.sources.resolver import parse_mid_list, resolve
-from ...core.sources.service import DEFAULT_LIMIT, SourceResult
+from ...core.sources.service import DEFAULT_LIMIT, FetchCancelledError, SourceResult
 from ..deps import Ctx
 
 router = APIRouter(prefix="/sources", tags=["sources"])
@@ -106,11 +106,26 @@ async def fetch(payload: FetchRequest, context: Ctx) -> dict[str, Any]:
     return _payload(context, result)
 
 
+@router.post("/cancel")
+async def cancel_fetch(context: Ctx) -> dict[str, Any]:
+    """取消正在进行的拉取.
+
+    大歌单要翻几十页, 耗时不短, 必须能中断. 取消在下一个翻页检查点生效,
+    并且**不返回半截列表** —— 半截列表看起来像完整的, 比拿不到更危险.
+    """
+    context.sources.cancel_fetch()
+    return {"cancelled": True}
+
+
 async def _guard(awaitable: Any) -> Any:
     """把库异常翻成 HTTP 错误."""
     try:
         return await awaitable
     except NotLoggedInError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
+    except FetchCancelledError as exc:
+        # 499 是 nginx 的「客户端主动断开」, 这里借来表达「用户取消」——
+        # 不是错误, 前端据此静默清空而不是弹错误框.
+        raise HTTPException(499, str(exc)) from exc
     except BaseApiException as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc

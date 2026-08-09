@@ -538,8 +538,21 @@ class QmdlerApp(App[None]):
         self._view = "tracks"
         self._sync_view_classes()
         self._fill_table()
-        self.query_one("#center-title", Label).update(f"{result['name']}（{result['count']} 首）")
-        self._write_log(f"已拉取 {result['count']} 首" + ("（已达上限）" if result.get("truncated") else ""))
+        # 截断要**常驻**在标题上, 不能只在日志里一闪而过 —— 用户会拿着不完整的
+        # 列表去建任务, 那比报错更糟.
+        if result.get("truncated"):
+            title = (
+                f"{result['name']}（{result['count']} / 共 {result.get('total') or '?'} 首"
+                f"　⚠ 已达上限，列表不完整）"
+            )
+            self._write_log(
+                f"[yellow]只拉到 {result['count']} 首，该来源共 "
+                f"{result.get('total') or '未知'} 首 —— 列表不完整，调大拉取上限后重拉[/yellow]",
+            )
+        else:
+            title = f"{result['name']}（{result['count']} 首）"
+            self._write_log(f"已拉取 {result['count']} 首")
+        self.query_one("#center-title", Label).update(title)
 
     async def _create_task(self) -> None:
         if not self._source_items:
