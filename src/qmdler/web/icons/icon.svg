@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="qmdler">
+  <rect width="512" height="512" rx="96" fill="#1f7a4d"/>
+  <g fill="#ffffff">
+    <!-- 音符 -->
+    <path d="M300 108v168a56 56 0 1 1-32-50V148l-96 24v152a56 56 0 1 1-32-50V148a24 24 0 0 1 18-23l120-30a24 24 0 0 1 22 13z" opacity=".95"/>
+    <!-- 下载箭头 -->
+    <path d="M368 260a16 16 0 0 1 16 16v76l30-30a16 16 0 1 1 22 23l-57 57a16 16 0 0 1-22 0l-57-57a16 16 0 1 1 22-23l30 30v-76a16 16 0 0 1 16-16z"/>
+  </g>
+</svg>

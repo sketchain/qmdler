@@ -1,0 +1,31 @@
+services:
+  qmdler:
+    build: .
+    # 或直接用构建好的镜像：
+    # image: ghcr.io/sketchain/qmdler:latest
+    container_name: qmdler
+    restart: unless-stopped
+    ports:
+      # 默认只绑定回环。要在局域网访问就改成 "8770:8770"，
+      # 但请注意本服务没有任何鉴权，别直接暴露到公网。
+      - "127.0.0.1:8770:8770"
+    volumes:
+      # /config 必须持久化：凭证和 device.json 都在这里。
+      # device.json 一旦丢失，设备指纹就变了，等同于频繁换设备登录，极易触发风控。
+      - ./config:/config
+      - ./data:/data
+      - ./music:/music
+    environment:
+      # 配置项都可以用环境变量覆盖，嵌套用 __ 分隔。
+      QMDLER_SERVER__HOST: "0.0.0.0"
+      QMDLER_SERVER__PORT: "8770"
+      QMDLER_PATHS__SAVE_ROOT: "/music"
+      # 每首之间的间隔，默认 180 秒。随机区间更不容易触发风控：
+      QMDLER_DOWNLOAD__RANDOM_INTERVAL: "true"
+      QMDLER_DOWNLOAD__INTERVAL_MIN_SECONDS: "150"
+      QMDLER_DOWNLOAD__INTERVAL_MAX_SECONDS: "210"
+      QMDLER_LOG__LEVEL: "INFO"
+      QMDLER_LOG__FILE: "/data/state/qmdler.log"
+      TZ: "Asia/Shanghai"
+    # 容器里跑的是单进程串行下载，资源占用很低。
+    mem_limit: 512m

@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 运行时产物 —— 绝不能提交：凭证和设备指纹在这里
+#
+# 这些模式必须用 / 锚定到仓库根目录。不锚定的 `config/` 会匹配到
+# src/qmdler/core/config/，而 hatchling 默认遵守 .gitignore，
+# 打出来的 wheel 会缺整个配置子包。
+/config/
+/data/
+/music/
+*.db
+*.db-wal
+*.db-shm
+*.log
+credential.json
+device.json
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,186 @@
+/* 响应式断点由 QmdlerApp.on_resize 在 Screen 上打的类驱动:
+   -narrow  (< 60 列)   单栏, 侧栏改为可切换的全屏视图
+   -medium  (60~99 列)  两栏
+   -wide    (>= 100 列) 三栏
+   目标: 40 / 80 / 120 列三种宽度下都可用, 不出现横向滚动或折行错乱. */
+
+Screen {
+  layers: base overlay;
+  background: $surface;
+}
+
+#topbar {
+  height: 1;
+  dock: top;
+  background: $panel;
+  color: $text-muted;
+  padding: 0 1;
+}
+
+#topbar.-alert {
+  background: $error;
+  color: $text;
+}
+
+#body {
+  height: 1fr;
+}
+
+#sidebar {
+  width: 30;
+  min-width: 22;
+  border-right: solid $panel-lighten-2;
+  padding: 0 1;
+}
+
+#center {
+  width: 1fr;
+  min-width: 20;
+  padding: 0 1;
+}
+
+#taskpane {
+  width: 40;
+  min-width: 28;
+  border-left: solid $panel-lighten-2;
+  padding: 0 1;
+}
+
+/* ---- 宽 (>=100 列): 三栏全开 ---- */
+Screen.-wide #sidebar { display: block; }
+Screen.-wide #center  { display: block; }
+Screen.-wide #taskpane { display: block; }
+
+/* ---- 中 (60~99 列): 收成两栏, 任务面板用 F3 切换 ---- */
+Screen.-medium #sidebar { display: block; width: 26; }
+Screen.-medium #center { display: block; }
+Screen.-medium #taskpane { display: none; }
+Screen.-medium.-show-tasks #center { display: none; }
+Screen.-medium.-show-tasks #taskpane { display: block; width: 1fr; border-left: none; }
+
+/* ---- 窄 (<60 列, 含 40 列的 Termux/SSH): 单栏全屏切换 ---- */
+Screen.-narrow #sidebar { display: none; }
+Screen.-narrow #center { display: block; width: 1fr; }
+Screen.-narrow #taskpane { display: none; }
+Screen.-narrow.-show-sources #sidebar { display: block; width: 1fr; border-right: none; }
+Screen.-narrow.-show-sources #center { display: none; }
+Screen.-narrow.-show-tasks #center { display: none; }
+Screen.-narrow.-show-tasks #taskpane { display: block; width: 1fr; border-left: none; }
+
+.pane-title {
+  color: $accent;
+  text-style: bold;
+  height: 1;
+}
+
+DataTable {
+  height: 1fr;
+  scrollbar-size-vertical: 1;
+}
+
+#tracks {
+  /* 不允许横向滚动: 窄宽度下靠隐藏次要列来适配 */
+  overflow-x: hidden;
+}
+
+#engine-status {
+  height: auto;
+  border: round $panel-lighten-2;
+  padding: 0 1;
+  margin-bottom: 1;
+}
+
+#countdown {
+  height: 1;
+  color: $warning;
+}
+
+#log {
+  height: 1fr;
+  min-height: 5;
+  border: round $panel-lighten-2;
+  background: $panel;
+}
+
+.counts {
+  height: 1;
+}
+
+Input {
+  height: 3;
+}
+
+Button {
+  min-width: 8;
+  height: 3;
+}
+
+.button-row {
+  height: 3;
+  align-horizontal: left;
+}
+
+/* ---- 登录 ---- */
+
+LoginScreen {
+  align: center middle;
+}
+
+#login-box {
+  width: 70;
+  max-width: 96%;
+  height: auto;
+  max-height: 90%;
+  border: thick $accent;
+  background: $surface;
+  padding: 1 2;
+}
+
+Screen.-narrow #login-box {
+  width: 100%;
+  max-width: 100%;
+  border: solid $accent;
+  padding: 0 1;
+}
+
+#qr-art {
+  height: auto;
+  content-align: center middle;
+  color: $text;
+  background: $surface;
+}
+
+#qr-hint {
+  height: auto;
+  color: $text-muted;
+}
+
+/* ---- 设置 / 报告 ---- */
+
+SettingsScreen, ReportScreen {
+  align: center middle;
+}
+
+#settings-box, #report-box {
+  width: 90;
+  max-width: 96%;
+  height: 90%;
+  border: thick $accent;
+  background: $surface;
+  padding: 1 2;
+}
+
+Screen.-narrow #settings-box,
+Screen.-narrow #report-box {
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  border: none;
+  padding: 0 1;
+}
+
+#chain-list {
+  height: 1fr;
+  min-height: 6;
+  border: round $panel-lighten-2;
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <!-- viewport-fit=cover 配合 env(safe-area-inset-*)，刘海屏不遮挡内容 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="QQ 音乐歌单批量下载器" />
+  <meta name="theme-color" content="#1f7a4d" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#14171a" media="(prefers-color-scheme: dark)" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="qmdler" />
+  <title>qmdler — QQ 音乐歌单批量下载器</title>
+
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+
+  <link rel="stylesheet" href="/css/tokens.css" />
+  <link rel="stylesheet" href="/css/layout.css" />
+  <link rel="stylesheet" href="/css/mobile.css" />
+
+  <!--
+    依赖全部 vendored 进包，不引用任何 CDN：
+    本工具面向自托管，可能跑在纯 IPv6、内网或访问不到境外 CDN 的环境里，
+    CDN 不可达会让整个 UI 白屏。
+
+    vue.global.prod.js 是全局构建，自带运行时编译器，依赖 new Function。
+    自托管场景不受影响；如果你在前面加了带 script-src 严格限制的反向代理 CSP，
+    需要允许 'unsafe-eval'，否则模板编译会被拦截。
+  -->
+  <script src="/vendor/vue.global.prod.js"></script>
+  <script src="/vendor/sortable.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div style="padding:40px;text-align:center;color:#888">正在加载 qmdler…</div>
+  </div>
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
