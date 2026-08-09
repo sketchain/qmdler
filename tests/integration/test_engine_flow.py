@@ -800,9 +800,15 @@ async def test_recent_success_expires(repo: Repository, settings: Settings) -> N
 # --------------------------------------------------------------------------- #
 # 降级链: requested / actual / degraded 的记账
 #
-# 实测上很难自然构造出这个场景 —— 2026-08 用真实凭证逐档探了 8 首歌共 105 个
-# `size_* > 0` 的档位, **无一取链失败**, 也就是说 `build_plan` 的 size 过滤已经
+# ⚠️ **本路径仅由 mock 覆盖, 真实环境从未触发过.** 读到这里的人请不要以为它
+# 经过实战检验 —— 下面这三条用例证明的是「逻辑写对了」, 不是「线上跑通了」.
+#
+# 为什么造不出真场景: 2026-08 用真实凭证逐档探了 **8 首歌共 105 个
+# `size_* > 0` 的档位, 无一取链失败**. 也就是说 `build_plan` 的 size 过滤已经
 # 把该挡的都挡掉了, 链上真正「有大小却取不到」的档位极其罕见.
+# (注意这个统计有前提: 整首歌被地区版权分区挡住时 `size_*` 照样非零而所有档位
+# 一律 104003 —— 那是整曲不可用, 不是降级.)
+#
 # 罕见不等于不会发生, 而且一旦发生, 记账错了用户就会拿到一个自以为是母带的 MP3.
 # 所以这里用确定性的方式把三个字段都钉住.
 # --------------------------------------------------------------------------- #
@@ -1054,7 +1060,7 @@ async def test_metadata_failure_does_not_fail_the_song(
     """三项附加内容全炸, 歌仍然要算成功, 文件仍然要在."""
     entry = make_entry("mid1", "歌一")
     payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
-    engine, _client, bus, http, _auth = await build_engine(
+    engine, _client, _bus, http, _auth = await build_engine(
         repo, settings, payloads, metadata=ExplodingMetadata(),
     )
     task = await make_task(repo, settings, [entry])

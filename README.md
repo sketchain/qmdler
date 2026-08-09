@@ -442,6 +442,7 @@ src/qmdler/
 | 声称 | 实际 |
 |---|---|
 | `get_song_urls` 超过 100 个 mid 抛 `ValueError` | 常量 `_GET_SONG_URLS_MAX_MID = 100` 定义了、docstring 也写了，但函数体里没有任何校验。本项目自行分批 |
+| `song.get_producer(mid)` 总能解析 | **上游模型的 `Lst` 字段没标 Optional，服务端回 `null` 时抛 pydantic `ValidationError`**（实测某首歌必现）。它既不是 `BaseApiException` 也不是网络错误，只 catch 那两类接不住 —— 本项目在 `metadata/service.py` 与引擎 `_best_effort()` 两处都放宽到 `except Exception`，附加内容失败绝不拖垮整首歌 |
 
 ### 实测发现（2026-08，未登录取试听档）
 
@@ -504,8 +505,13 @@ src/qmdler/
   「这个档位存不存在」，**不是**「这首歌拿不拿得到」。两件事别混。
 
   在可播的前提下，`build_plan` 的 size 过滤确实承担了几乎全部选档工作，
-  「链上有大小却取不到」的真实降级极其罕见 —— 罕见不等于不发生，记账仍然必须正确
-  （所以那条路径由 mock 用例钉住，见 `test_degrade_records_requested_actual_and_flag`）。
+  「链上有大小却取不到」的真实降级极其罕见。
+
+  **由此带来一条要如实说明的覆盖缺口：降级路径（`degraded` / `requested_quality` /
+  `actual_quality` 三个字段的记账）目前只有 mock 用例覆盖，真实环境从未触发过。**
+  罕见不等于不发生，而且一旦发生、记账又错了，用户会拿到一个自以为是母带的 MP3 ——
+  所以还是用三条确定性用例钉住了，见 `test_degrade_records_requested_actual_and_flag`
+  及其上方的注释。
 - **dispatch 会返回重复域名。** 实测 7 个节点里 `http://aqqmusic.tc.qq.com/` 占 3 个，
   而它恰好是不放行的那个。不去重的话「同档内随机」等于给它加权，白白多试两次，
   所以 `dispatch()` 里按顺序去重。
