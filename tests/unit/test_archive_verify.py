@@ -165,3 +165,36 @@ def test_real_audio_errors_still_fail(tmp_path: Path, monkeypatch: pytest.Monkey
     details = {name: detail for name, _state, detail in verdict.checks}
     assert "CRC" in details["ffmpeg 音频解码"]
     assert verdict.status == "failed"
+
+
+def test_missing_codec_is_skipped_not_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本机 ffmpeg 不会解这个编码 ≠ 文件坏了.
+
+    实测：`ATMOS_DB`（杜比全景声）是 .mp4 容器里的 AC-4，ffmpeg 6.1 没有
+    AC-4 解码器。判 failed 等于告诉用户「你的杜比全景声文件坏了」，
+    而 ffprobe 读得出流信息、字节数与 `size_dolby` 精确相等。
+    """
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[0] == "ffmpeg":
+            return 1, "", (
+                "[aist#0:1/ac4 @ 0x1] Decoding requested, but no decoder found for: ac4\n"
+                "[aost#0:1/pcm_s16le @ 0x2] Error initializing a simple filtergraph\n"
+                "Error opening output file -.\n"
+            )
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    # 用真文件：mutagen 那一层要能过，才测得到解码这一层。
+    path = tmp_path / "song.m4a"
+    shutil.copy(AUDIO / "silence.m4a", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "skipped"
+    # 后面那几行 filtergraph / output file 都是缺解码器的后果，不能各判一次 failed。
+    assert verdict.status != "failed"

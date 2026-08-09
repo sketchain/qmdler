@@ -144,6 +144,17 @@ def verify_file(path: Path) -> FileVerdict:
 #: 只可能是内嵌封面, 所以按这个标签就能把封面的抱怨和音频的问题分开.
 _COVER_DECODER_RE = re.compile(r"^\[(?:mjpeg|png|image2)\s*@")
 
+#: 「本机 ffmpeg 不会解这个编码」的特征. 这**不是文件损坏**.
+#:
+#: 实测: ``ATMOS_DB`` (杜比全景声) 是 ``.mp4`` 容器里的 **AC-4**, 而 ffmpeg 6.1
+#: 根本没有 AC-4 解码器, 于是报 ``no decoder found for: ac4`` 并连带打出
+#: ``Error initializing a simple filtergraph`` / ``Error opening output file``
+#: 这些**后果性**的错误行. 文件本身没问题 —— ffprobe 能正确读出
+#: ``ac4 48000Hz 2ch``, mutagen 读得出 325.89s, 字节数与 ``size_dolby`` 精确相等.
+#:
+#: 把它判成 failed 就是在说「你的杜比全景声文件坏了」, 而实际只是校验工具不会解.
+_NO_DECODER_RE = re.compile(r"no decoder found for|[Dd]ecoder .* not found|Unsupported codec")
+
 
 def _decode(path: Path, verdict: FileVerdict) -> None:
     """全量解码, 并把**内嵌封面的抱怨**与**音频的问题**分开.
@@ -163,7 +174,15 @@ def _decode(path: Path, verdict: FileVerdict) -> None:
     cover_lines = [line for line in lines if _COVER_DECODER_RE.match(line.strip())]
     audio_lines = [line for line in lines if line not in cover_lines]
 
-    if audio_lines:
+    if any(_NO_DECODER_RE.search(line) for line in audio_lines):
+        # 本机 ffmpeg 不会解这个编码 —— 无从校验, 不是文件坏了.
+        # 后面那几行 filtergraph / output file 的报错都是这一条的后果.
+        verdict.add(
+            "ffmpeg 音频解码", "skipped",
+            f"本机 ffmpeg 没有 {verdict.codec or '该编码'} 的解码器，无从校验"
+            f"（不代表文件有问题）",
+        )
+    elif audio_lines:
         verdict.add("ffmpeg 音频解码", "failed", " / ".join(audio_lines)[:300])
     else:
         verdict.add("ffmpeg 音频解码", "ok", "stderr 干净（封面的抱怨不算）")

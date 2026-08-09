@@ -551,6 +551,23 @@ src/qmdler/
   那张附图了。所以 `qmdler verify` 是按 stderr 的解码器标签（`[mjpeg @ ...]`）
   把封面的抱怨和音频的问题分开，前者记 `note`，后者才算 `failed`。
   不分的话 20 首里有 4 首会被误判成音频损坏，真正的音频问题反而被淹掉。
+- **全部 13 个可用档位逐档端到端跑通。** 同一首歌（`003hKob536i6FA`，13 档 `size_*` 非零）
+  逐档单独下载：四字符前缀 13/13 与请求编码一致；落盘扩展名 13/13 与 `SongFileType.e` 相符
+  （含 `ATMOS_DB` → `.mp4`、`OGG_640` → `.ogg` 这两个容易错的）；ffprobe 的容器与 codec
+  与扩展名自洽；字节数 13/13 与 `size_*` 声明精确相等；`get_song_urls` 13 次对 13 档，
+  每档一次、无隐藏重试。
+
+  两点值得记：**低码率档位（`ACC_96` / `ACC_48`）在登录态下给的是完整文件而非试听片段**
+  （字节数与声明一致、时长 ≈326s），所以第 2 层的绝对值比对不会误伤它们；
+  `OGG_640` 实测是 **4 声道**，不是立体声。
+- **`ATMOS_DB`（杜比全景声）是 `.mp4` 容器里的 AC-4，而 ffmpeg 6.1 没有 AC-4 解码器。**
+  报 `no decoder found for: ac4`，并连带打出 `Error initializing a simple filtergraph`
+  等**后果性**错误行。文件本身没问题：ffprobe 正确读出 `ac4 48000Hz 2ch`，
+  mutagen 读得出 325.89s，字节数与 `size_dolby` 精确相等，MP4 tag（`covr` / `©lyr` /
+  freeform 作词）全部写入正常。
+
+  所以 `qmdler verify` 把「本机没有该编码的解码器」判成 `skipped` 而不是 `failed` ——
+  判 failed 等于告诉用户「你的杜比全景声文件坏了」。
 - **`.nac` 三样全废**：`ffprobe` / `ffmpeg` 一律 `Invalid data found when processing input`，
   mutagen 既读不出时长也写不了 tag。文件能下下来（字节数与 `size_new[7]` 一致）但基本没法用，
   所以在音质选择处直接标注出来，让人选之前就知道。
