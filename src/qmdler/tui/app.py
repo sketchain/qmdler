@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Textual 应用.
 
 纯客户端: 全部动作走 REST, 状态走 WebSocket, 与 WebUI 连的是同一个后端.
@@ -529,7 +530,12 @@ class QmdlerApp(App[None]):
     async def _fetch(self, source_type: str, identifier: str) -> None:
         self._write_log(f"正在拉取 {source_type} …")
         result = await self.api.fetch_source(
-            {"source_type": source_type, "identifier": identifier, "limit": 2000},
+            {
+                "source_type": source_type,
+                "identifier": identifier,
+                # 上限只有后端一个来源，TUI 不写死（见 config 的 limits）。
+                "limit": ((self._config.get("limits") or {}).get("fetch_default") or 10000),
+            },
         )
         self._source_items = result["items"]
         self._source_meta = result
@@ -538,8 +544,21 @@ class QmdlerApp(App[None]):
         self._view = "tracks"
         self._sync_view_classes()
         self._fill_table()
-        self.query_one("#center-title", Label).update(f"{result['name']}（{result['count']} 首）")
-        self._write_log(f"已拉取 {result['count']} 首" + ("（已达上限）" if result.get("truncated") else ""))
+        # 截断要**常驻**在标题上, 不能只在日志里一闪而过 —— 用户会拿着不完整的
+        # 列表去建任务, 那比报错更糟.
+        if result.get("truncated"):
+            title = (
+                f"{result['name']}（{result['count']} / 共 {result.get('total') or '?'} 首"
+                f"　⚠ 已达上限，列表不完整）"
+            )
+            self._write_log(
+                f"[yellow]只拉到 {result['count']} 首，该来源共 "
+                f"{result.get('total') or '未知'} 首 —— 列表不完整，调大拉取上限后重拉[/yellow]",
+            )
+        else:
+            title = f"{result['name']}（{result['count']} 首）"
+            self._write_log(f"已拉取 {result['count']} 首")
+        self.query_one("#center-title", Label).update(title)
 
     async def _create_task(self) -> None:
         if not self._source_items:

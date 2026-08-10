@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 窄屏 (<768px): 三栏折叠为单栏 + 底部标签栏切换; 曲目表改为卡片列表. */
 
 /* 中等宽度 (768–1100px): 收成两栏, 右侧任务面板与中栏共用同一格,
@@ -95,13 +96,8 @@
     display: none;
   }
 
-  /* 宽表格在手机上不可用, 换成卡片 */
-  .table-wrap {
-    display: none;
-  }
-  .tracks-cards {
-    display: block;
-  }
+  /* 宽表格在手机上不可用, 换成卡片 —— 具体渲染哪一种由 JS 决定，
+     这里只负责卡片的样式。 */
 
   .track-card {
     display: flex;
@@ -109,6 +105,9 @@
     align-items: flex-start;
     padding: 10px 8px;
     border-bottom: 1px solid var(--border);
+    /* 高度固定，窗口化渲染要靠它算偏移；与 tracks.js 里的 CARD_H 必须一致。 */
+    height: 104px;
+    overflow: hidden;
   }
   .track-card__body {
     flex: 1 1 auto;

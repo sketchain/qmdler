@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """附加元数据的获取与落盘.
 
 歌词、封面、作曲/作词、流派都在这里, 统一走**元数据轻量限速** (0.5~1s),
@@ -21,7 +22,6 @@ from pathlib import Path
 
 import httpx
 from qqmusic_api import Client
-from qqmusic_api.core.exceptions import BaseApiException
 
 from ..config.schema import CoverConfig, DownloadConfig, LyricConfig, TagConfig
 from ..models import SongEntry, SubStatus
@@ -29,6 +29,18 @@ from . import lyric as lyric_utils
 from .cover import EMPTY_COVER, CoverFetcher, CoverResult
 
 logger = logging.getLogger(__name__)
+
+#: 这个模块里的每一次外部请求都 ``except Exception``, 是有意的:
+#:
+#: 实测撞到过 ``song.get_producer`` 抛 pydantic ``ValidationError`` ——
+#: 上游模型的 ``Lst`` 字段没标 Optional, 服务端回 ``null`` 就炸.
+#: 它既不是 ``BaseApiException`` 也不是网络错误, 只 catch 那两类就会漏,
+#: 而漏出去的后果是**整首歌被记成 failed**, 尽管音频早就完整落盘了.
+#:
+#: 附加内容的失败模式来自「上游模型 × 服务端返回」的组合, 列不全.
+#: 这里的取舍很明确: 宁可静默降级成「没拿到」, 也不能拖垮主流程.
+#: 引擎侧 ``_best_effort`` 还有一层同样的兜底.
+_WHY_BROAD = __doc__
 
 #: ``song.get_producer`` 返回的分组标题里, 这些算作曲 / 作词.
 _COMPOSER_TITLES = ("作曲", "谱曲", "Composer")
@@ -69,7 +81,7 @@ class MetadataService:
         self._client = client
         self._http = http
         self._config = download_config
-        self._cover = CoverFetcher(http)
+        self._cover = CoverFetcher(http, delay=self._delay)
         #: album_mid → 流派文本. 整张专辑只请求一次.
         self._genre_cache: dict[str, str] = {}
 
@@ -97,7 +109,7 @@ class MetadataService:
                 roma=config.romaji,
                 singing_annotations=config.singing_annotations,
             )
-        except BaseApiException as exc:
+        except Exception as exc:  # 附加内容, 见下方 _WHY_BROAD
             logger.warning("获取歌词失败 %s: %s", entry.songmid, exc)
             return LyricBundle(status=SubStatus.FAILED, message=str(exc))
 
@@ -140,7 +152,7 @@ class MetadataService:
             await self._delay()
             try:
                 multi = await self._client.lyric.get_multi_style_trans_lyric(entry.songid)
-            except BaseApiException as exc:
+            except Exception as exc:  # 附加内容, 见下方 _WHY_BROAD
                 logger.debug("多风格翻译获取失败 %s: %s", entry.songmid, exc)
             else:
                 for item in getattr(multi, "lyrics", None) or []:
@@ -208,7 +220,7 @@ class MetadataService:
         await self._delay()
         try:
             response = await self._client.song.get_producer(entry.songmid)
-        except BaseApiException as exc:
+        except Exception as exc:  # 附加内容, 见下方 _WHY_BROAD
             logger.debug("获取制作人失败 %s: %s", entry.songmid, exc)
             return "", ""
 
@@ -239,7 +251,7 @@ class MetadataService:
         await self._delay()
         try:
             response = await self._client.album.get_detail(album_mid)
-        except BaseApiException as exc:
+        except Exception as exc:  # 附加内容, 见下方 _WHY_BROAD
             logger.debug("获取专辑详情失败 %s: %s", album_mid, exc)
             self._genre_cache[album_mid] = ""
             return ""

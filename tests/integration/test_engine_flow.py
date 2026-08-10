@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载引擎端到端流程 (全 mock, 不触网).
 
 重点验证几条硬约束:
@@ -10,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -20,7 +22,7 @@ import pytest
 from qmdler.core.config.schema import Settings
 from qmdler.core.download.engine import DownloadEngine, new_task_id
 from qmdler.core.events import EventBus
-from qmdler.core.models import ItemStatus, SongEntry, TaskRecord, TaskStatus
+from qmdler.core.models import ItemStatus, SongEntry, SubStatus, TaskRecord, TaskStatus
 from qmdler.core.storage.repository import Repository
 
 CDN_BASE = "https://cdn.example.com/"
@@ -51,11 +53,19 @@ class FakeSongApi:
     def __init__(self) -> None:
         self.url_calls: list[list[Any]] = []
         self.behaviour: dict[str, str] = {}
+        #: mid -> 该首歌哪些档位取链失败 (result=104003), 用来构造降级链.
+        self.denied_qualities: dict[str, set[str]] = {}
+        self.cdn_nodes = list(FakeSongApi.cdn_nodes)
+
+    #: dispatch 返回的节点列表, 单个用例可覆盖.
+    cdn_nodes: ClassVar[list[str]] = [CDN_BASE]
 
     async def get_cdn_dispatch(self) -> Any:
+        nodes = self.cdn_nodes
+
         class Response:
             retcode = 0
-            sip: ClassVar[list[str]] = [CDN_BASE]
+            sip = nodes
             expiration = 3600
 
         return Response()
@@ -79,7 +89,7 @@ class FakeSongApi:
             prefix = info.file_type.s
             if mode == "trial":
                 prefix = "RS02"
-            if mode == "denied":
+            if mode == "denied" or prefix in self.denied_qualities.get(info.mid, set()):
                 items.append(FakeUrlInfo(info.mid, "", "", result=104003))
                 continue
             items.append(
@@ -214,10 +224,18 @@ async def repo(tmp_path: Path) -> Any:
     await repository.close()
 
 
-def make_http(payloads: dict[str, bytes]) -> httpx.AsyncClient:
-    """按 URL 返回固定内容的假 CDN."""
+def make_http(payloads: dict[str, bytes], serving_hosts: set[str] | None = None) -> httpx.AsyncClient:
+    """按 URL 返回固定内容的假 CDN.
+
+    Args:
+        payloads: 路径 → 内容.
+        serving_hosts: 只有这些 host 放行, 其余一律 403 —— 复刻实测中
+            「同一条 purl 只有个别节点给下」的真实行为.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if serving_hosts is not None and request.url.host not in serving_hosts:
+            return httpx.Response(403)
         name = request.url.path.lstrip("/")
         body = payloads.get(name)
         if body is None:
@@ -243,11 +261,21 @@ def make_http(payloads: dict[str, bytes]) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url=CDN_BASE)
 
 
-async def build_engine(repo: Repository, settings: Settings, payloads: dict[str, bytes]) -> tuple[Any, ...]:
+async def build_engine(
+    repo: Repository,
+    settings: Settings,
+    payloads: dict[str, bytes],
+    *,
+    cdn_nodes: list[str] | None = None,
+    serving_hosts: set[str] | None = None,
+    metadata: Any = None,
+) -> tuple[Any, ...]:
     """组装引擎."""
     client = FakeClient()
+    if cdn_nodes is not None:
+        client.song.cdn_nodes = cdn_nodes
     bus = EventBus()
-    http = make_http(payloads)
+    http = make_http(payloads, serving_hosts)
     auth = FakeAuth()
     engine = DownloadEngine(
         client,  # type: ignore[arg-type]
@@ -255,7 +283,7 @@ async def build_engine(repo: Repository, settings: Settings, payloads: dict[str,
         repo,
         bus,
         settings,
-        FakeMetadata(),  # type: ignore[arg-type]
+        metadata or FakeMetadata(),  # type: ignore[arg-type]
         FakeSources(),  # type: ignore[arg-type]
         http,
     )
@@ -515,3 +543,630 @@ async def test_report_separates_trial_from_success(repo: Repository, settings: S
     assert payload["counts"]["trial"] == 1
     assert len(payload["trials"]) == 1
     assert payload["trials"][0]["title"] == "歌一"
+
+
+# --------------------------------------------------------------------------- #
+# CDN 节点轮换
+#
+# 实测 (2026-08, 未登录取试听档) 发现: dispatch 返回的 6 个节点里, 同一条 purl
+# 只有 1 个放行, 其余全部 403 —— 但这 6 个节点的 keepalive 探针都返回 200。
+# 所以 403 是「这个节点不给这条链接」, 不是链接失效, 更不是节点挂了。
+# --------------------------------------------------------------------------- #
+
+REJECTING_NODES = [
+    "https://a.example.com/",
+    "https://b.example.com/",
+    "https://good.example.com/",
+    "https://d.example.com/",
+]
+
+
+async def test_rotates_cdn_nodes_without_refetching_vkey(repo: Repository, settings: Settings) -> None:
+    """多数节点 403 时换节点重试同一条 purl, 不重新取 vkey.
+
+    为 403 去重新取 vkey 会把每首歌的接口请求数翻好几倍, 正是最该避免的
+    风控特征。
+    """
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, client, _bus, http, _auth = await build_engine(
+        repo,
+        settings,
+        payloads,
+        cdn_nodes=REJECTING_NODES,
+        serving_hosts={"good.example.com"},
+    )
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 1, "只要有一个节点放行就该下成功"
+    assert len(client.song.url_calls) == 1, "403 不该触发重新取 vkey"
+
+    item = (await repo.list_items(task.id))[0]
+    assert Path(item.target_path).exists()
+
+
+async def test_prefers_known_good_node_on_subsequent_songs(repo: Repository, settings: Settings) -> None:
+    """第一首摸清哪个节点能用之后, 后面的歌优先走它, 少打无谓的 403 请求."""
+    entries = [make_entry(f"mid{i}", f"歌{i}") for i in range(1, 5)]
+    payloads = {f"M500{e.songmid}.mp3": b"x" * FULL_SIZE for e in entries}
+    engine, client, _bus, http, _auth = await build_engine(
+        repo,
+        settings,
+        payloads,
+        cdn_nodes=REJECTING_NODES,
+        serving_hosts={"good.example.com"},
+    )
+    task = await make_task(repo, settings, entries)
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 4
+    assert len(client.song.url_calls) == 4, "每首歌仍然只取一次链"
+
+    snapshot = engine._cdn.snapshot
+    good = next(node for node in snapshot["nodes"] if "good" in node["base"])
+    assert good["successes"] >= 4
+    assert good["tier"] == 0, "成功过的节点应当排在最前"
+    assert good["rejections_since_success"] == 0, "成功要清零拒绝计数"
+
+    # 摸清之后就不该再往被拒的节点上撞: 只有第一首可能撞, 上限是 节点数-1。
+    total_rejections = sum(node["rejections_since_success"] for node in snapshot["nodes"])
+    assert total_rejections <= len(REJECTING_NODES) - 1, f"仍在反复撞被拒节点: {snapshot['nodes']}"
+
+
+async def test_all_nodes_rejecting_refetches_vkey_once(repo: Repository, settings: Settings) -> None:
+    """全部节点都拒绝时才值得重新取一次 vkey."""
+    entry = make_entry("mid1", "歌一")
+    engine, client, _bus, http, _auth = await build_engine(
+        repo,
+        settings,
+        {},
+        cdn_nodes=REJECTING_NODES,
+        serving_hosts=set(),  # 没有任何节点放行
+    )
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    assert len(client.song.url_calls) == 2, "应当且只应当重新取一次 vkey"
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 0
+    assert counts[ItemStatus.UNAVAILABLE.value] == 1
+
+
+# --------------------------------------------------------------------------- #
+# --single 诊断模式
+# --------------------------------------------------------------------------- #
+
+
+async def test_diagnosis_records_every_layer(repo: Repository, settings: Settings) -> None:
+    """四层校验每一层的实际判定值都要落进诊断记录."""
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    payload = diagnosis.as_dict()
+    names = [layer["name"] for layer in payload["layers"]]
+    assert any("第1层" in name for name in names)
+    assert any("第2层" in name for name in names)
+    assert any("第3层" in name and "下载前" in name for name in names)
+    assert any("第3层" in name and "落盘后" in name for name in names)
+    assert any("第4层" in name for name in names)
+
+    assert payload["verdict"] == "success"
+    assert payload["requested_start_code"] == "M500"
+    assert payload["extracted_prefix"] == "M500"
+    assert payload["probe_method"] in ("head", "range")
+    assert payload["cdn_used"]
+    assert payload["content_length"] == FULL_SIZE
+    assert payload["downloaded_bytes"] == FULL_SIZE
+    # sa 原样透传, 供实测标定
+    assert payload["sa"] == entry.sa
+    assert payload["trial_window_source"]
+
+
+async def test_diagnosis_never_leaks_secrets(repo: Repository, settings: Settings) -> None:
+    """诊断输出里绝不能出现 vkey / musickey / 完整 purl."""
+    import json
+
+    from qmdler.core.download.diagnose import contains_secret
+
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    text = json.dumps(diagnosis.as_dict(), ensure_ascii=False)
+    assert contains_secret(text) == ""
+    # purl 只留最后一个路径段
+    assert diagnosis.purl_filename == "M500mid1.mp3"
+    assert "?" not in diagnosis.purl_filename
+
+
+async def test_diagnosis_records_result_code_when_unavailable(repo: Repository, settings: Settings) -> None:
+    """拿不到 purl 时也要记下 result —— 「为什么下不了」全靠它."""
+    entry = make_entry("mid1", "歌一")
+    engine, client, _bus, http, _auth = await build_engine(repo, settings, {})
+    client.song.behaviour["mid1"] = "denied"
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    payload = diagnosis.as_dict()
+    assert payload["result_code"] == 104003
+    assert payload["attempted_quality"] == "MP3_128"
+    assert payload["verdict"] == "unavailable"
+
+
+async def test_diagnosis_skips_download_interval(repo: Repository, settings: Settings) -> None:
+    """诊断模式跳过间隔, 不然一首歌要等 3 分钟."""
+    settings.download.interval_seconds = 600.0
+    entries = [make_entry("mid1", "歌一"), make_entry("mid2", "歌二")]
+    payloads = {f"M500{e.songmid}.mp3": b"x" * FULL_SIZE for e in entries}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    engine.enable_diagnosis()
+    task = await make_task(repo, settings, entries)
+
+    await engine.start(task.id)
+    await asyncio.wait_for(engine.wait_idle(), timeout=20)
+    await http.aclose()
+
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 2
+
+
+async def test_rejections_do_not_accumulate_across_songs(repo: Repository, settings: Settings) -> None:
+    """「这条 purl 被谁拒过」是 per-purl 的, 换歌就丢.
+
+    若把拒绝记录攒在节点上跨曲目累积, 跑一阵之后所有节点都会带着拒绝记录,
+    分档退化成随机 —— 这轮的修复会在第 20 首左右悄悄失效.
+    """
+    entries = [make_entry(f"mid{i}", f"歌{i}") for i in range(1, 6)]
+    payloads = {f"M500{e.songmid}.mp3": b"x" * FULL_SIZE for e in entries}
+    engine, _client, _bus, http, _auth = await build_engine(
+        repo,
+        settings,
+        payloads,
+        cdn_nodes=REJECTING_NODES,
+        serving_hosts={"good.example.com"},
+    )
+    task = await make_task(repo, settings, entries)
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    counts = await repo.status_counts(task.id)
+    assert counts[ItemStatus.SUCCESS.value] == 5
+
+    # per-purl 记录在每首歌开始时清空, 跑完不该留下一大堆
+    assert len(engine._purl_rejections) <= 1, f"per-purl 拒绝记录在累积: {engine._purl_rejections}"
+
+    # 放行节点始终是 tier 0，从未被降级
+    snapshot = engine._cdn.snapshot
+    good = next(node for node in snapshot["nodes"] if "good" in node["base"])
+    assert good["tier"] == 0
+
+
+async def test_success_clears_rejection_penalty(repo: Repository, settings: Settings) -> None:
+    """一次成功就清零拒绝计数 —— 拒绝不是永久污点, 网络环境变了能跟着换."""
+    from qmdler.core.download.cdn import CdnManager, CdnNode
+
+    manager = CdnManager(client=None)  # type: ignore[arg-type]
+    node = CdnNode(base="https://x/")
+
+    manager.report_rejection(node)
+    manager.report_rejection(node)
+    assert node.tier == 2, "连续被拒应当降到最后一档"
+
+    manager.report_success(node)
+    assert node.rejections_since_success == 0
+    assert node.tier == 0, "成功之后应当立刻回到首选"
+
+
+async def test_recent_success_expires(repo: Repository, settings: Settings) -> None:
+    """「最近成功过」会过期 —— 免得死守一个早就不放行的节点."""
+    import time as time_module
+
+    from qmdler.core.download.cdn import SUCCESS_TTL, CdnNode
+
+    node = CdnNode(base="https://x/", last_success=time_module.time() - SUCCESS_TTL - 1)
+    assert node.tier == 1, "成功记录过期后退回「情况未知」，重新参与试探"
+
+
+# --------------------------------------------------------------------------- #
+# 降级链: requested / actual / degraded 的记账
+#
+# ⚠️ **本路径仅由 mock 覆盖, 真实环境从未触发过.** 读到这里的人请不要以为它
+# 经过实战检验 —— 下面这三条用例证明的是「逻辑写对了」, 不是「线上跑通了」.
+#
+# 为什么造不出真场景: 2026-08 用真实凭证逐档探了 **8 首歌共 105 个
+# `size_* > 0` 的档位, 无一取链失败**. 也就是说 `build_plan` 的 size 过滤已经
+# 把该挡的都挡掉了, 链上真正「有大小却取不到」的档位极其罕见.
+# (注意这个统计有前提: 整首歌被地区版权分区挡住时 `size_*` 照样非零而所有档位
+# 一律 104003 —— 那是整曲不可用, 不是降级.)
+#
+# 罕见不等于不会发生, 而且一旦发生, 记账错了用户就会拿到一个自以为是母带的 MP3.
+# 所以这里用确定性的方式把三个字段都钉住.
+# --------------------------------------------------------------------------- #
+
+
+async def test_degrade_records_requested_actual_and_flag(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """链头取链失败时, 降级到下一档并如实记账."""
+    settings.quality.chain = ["FLAC", "MP3_320", "MP3_128"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE, "MP3_128": FULL_SIZE}
+    payloads = {"M800mid1.mp3": b"y" * FULL_SIZE}
+    engine, client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    # FLAC 有大小但取不到, 应当落到 MP3_320.
+    client.song.denied_qualities["mid1"] = {"F000"}
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.requested_quality == "FLAC", "记的必须是链头, 不是实际拿到的那档"
+    assert item.actual_quality == "MP3_320"
+    assert item.degraded is True
+
+
+async def test_no_degrade_flag_when_chain_head_succeeds(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """链头就拿到了, 不能误标降级."""
+    settings.quality.chain = ["FLAC", "MP3_320"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE}
+    payloads = {"F000mid1.flac": b"y" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.requested_quality == "FLAC"
+    assert item.actual_quality == "FLAC"
+    assert item.degraded is False
+
+
+async def test_missing_tier_is_not_a_degrade(repo: Repository, settings: Settings) -> None:
+    """链头档位**不存在** (size 为 0) 属于正常选档, 不算降级.
+
+    实测绝大多数「没拿到母带」都是这一类 —— 该曲目根本没做过母带.
+    把它记成 degraded 会让降级统计彻底失真.
+    """
+    settings.quality.chain = ["MASTER", "FLAC", "MP3_320"]
+    entry = make_entry("mid1", "歌一")
+    entry.sizes = {"FLAC": FULL_SIZE, "MP3_320": FULL_SIZE}  # 没有 MASTER
+    payloads = {"F000mid1.flac": b"y" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.requested_quality == "FLAC", "链上第一个**存在**的档位才是 requested"
+    assert item.actual_quality == "FLAC"
+    assert item.degraded is False
+
+
+# --------------------------------------------------------------------------- #
+# 「这层没跑」不得标 ok
+#
+# 静默少一层校验是本项目最怕的失效方式 —— `.nac` 上就真的发生过:
+# `check_duration` 因为 `actual_seconds <= 0` 直接放行, 诊断里打的是 `ok`,
+# 「四层校验」无声变成三层.
+# --------------------------------------------------------------------------- #
+
+
+async def test_layers_report_skipped_when_data_is_missing(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """缺 size_try / interval 时, 对应层标 skipped 而不是 ok."""
+    entry = make_entry("mid1", "歌一")
+    entry.size_try = 0        # 第 2 层无基准
+    entry.interval = 0        # 第 4 层无基准
+    entry.try_begin_ms = 0    # 两组试听窗口都缺席
+    entry.try_end_ms = 0
+    entry.vi = []
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    layers = {layer["name"]: layer["verdict"] for layer in diagnosis.as_dict()["layers"]}
+    assert layers["第2层 试听片段绝对大小基准（size_try）"] == "skipped"
+    assert layers["第4层 实际时长 vs interval"] == "skipped"
+    assert layers["第4层 实际时长 vs 试听窗口"] == "skipped"
+    # 有数据的层照常跑.
+    assert layers["第1层 filename 前缀"] == "ok"
+
+
+async def test_no_layer_claims_ok_without_running(repo: Repository, settings: Settings) -> None:
+    """兜底断言: 任何标了 ok 的层, 说明里都不能写着「本层未执行」."""
+    entry = make_entry("mid1", "歌一")
+    entry.size_try = 0
+    entry.interval = 0
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    for layer in diagnosis.as_dict()["layers"]:
+        if layer["verdict"] == "ok":
+            assert "未执行" not in layer["detail"], f"{layer['name']} 标了 ok 却没跑"
+
+
+async def test_duration_layers_actually_run_on_real_audio(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """喂真音频时, 第 4 层的两半都要真跑起来.
+
+    这条用例存在的意义: 其余用例的 payload 都是 ``b"x" * N``, mutagen 读不出
+    时长, 于是第 4 层永远是 ``unverified``. 光看那些用例, 分不出「实现正确」
+    和「第 4 层根本没跑过」—— 所以这里必须用一个真文件.
+    """
+    real = (Path(__file__).resolve().parents[1] / "data" / "audio" / "silence.mp3").read_bytes()
+    settings.quality.reject_trial = False  # 0.25 秒当然比 interval 短, 不拦
+    entry = make_entry("mid1", "歌一", size=len(real))
+    payloads = {"M500mid1.mp3": real}
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    diagnosis = engine.enable_diagnosis()
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    payload = diagnosis.as_dict()
+    layers = {layer["name"]: layer["verdict"] for layer in payload["layers"]}
+    assert layers["第4层 实际时长 vs interval"] not in ("skipped", "unverified")
+    assert layers["第4层 实际时长 vs 试听窗口"] not in ("skipped", "unverified")
+    assert payload["actual_duration"] > 0, "真文件必须读得出时长"
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.verify_incomplete is False, "读得出时长就不算校验不完整"
+
+
+async def test_report_separates_incomplete_verification(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """校验层不完整的曲目必须在报告里单列, 不能藏在 success 里.
+
+    否则报告会给出「全部通过四层校验」的假象, 而实际上有几首只跑了三层。
+    """
+    from qmdler.core.report import build_report, export_csv
+
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}  # 假字节 → 读不出时长
+    engine, _client, _bus, http, _auth = await build_engine(repo, settings, payloads)
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS
+    assert item.verify_incomplete is True
+
+    report = await build_report(repo, task.id)
+    assert report is not None
+    payload = report.as_dict()
+    assert len(payload["incomplete_verification"]) == 1
+    assert payload["fully_verified"] == 0, "成功 1 首，但没有一首跑全四层"
+    assert "校验层不完整" in payload["summary"]
+
+    csv_text = await export_csv(repo, task.id)
+    assert "校验完整" in csv_text.splitlines()[0]
+    assert "否（有层未执行）" in csv_text
+
+
+async def test_dispatch_deduplicates_nodes(repo: Repository, settings: Settings) -> None:
+    """dispatch 返回重复域名时要去重.
+
+    实测 dispatch 会把 ``http://aqqmusic.tc.qq.com/`` 返回三次。不去重的话
+    同档内随机就等于给它加权，而它恰好是不放行的那个。
+    """
+    from qmdler.core.download.cdn import CdnManager
+
+    _engine, client, _bus, http, _auth = await build_engine(repo, settings, {})
+    client.song.cdn_nodes = [
+        "http://a.example.com/",
+        "http://b.example.com/",
+        "http://a.example.com/",
+        "http://a.example.com/",
+    ]
+    cdn = CdnManager(client)
+    pool = await cdn.dispatch()
+    await http.aclose()
+
+    bases = [node.base for node in pool.nodes]
+    assert bases == ["http://a.example.com/", "http://b.example.com/"], "重复域名要去掉，顺序保持"
+
+
+# --------------------------------------------------------------------------- #
+# 附加内容失败不得拖垮主流程
+#
+# 实测撞到过: `song.get_producer` 抛 pydantic ValidationError (上游模型的 `Lst`
+# 没标 Optional, 服务端回 null 就炸), 结果**整首歌被记成 failed** —— 音频明明
+# 已经完整落盘。附加内容是锦上添花, 拿不到就标一下。
+# --------------------------------------------------------------------------- #
+
+
+class ExplodingMetadata(FakeMetadata):
+    """每一项附加内容都炸, 而且炸的是 `BaseApiException` 之外的类型."""
+
+    async def fetch_lyric(self, entry: Any, config: Any) -> Any:
+        raise ValueError("歌词接口返回了模型吃不下的结构")
+
+    async def fetch_cover(self, entry: Any, config: Any, *, for_embed: bool) -> Any:
+        raise TypeError("封面接口返回了 None")
+
+    async def fetch_extra_tags(self, entry: Any, config: Any) -> Any:
+        raise ValueError("1 validation error for GetProducerResponse")
+
+
+async def test_metadata_failure_does_not_fail_the_song(
+    repo: Repository,
+    settings: Settings,
+) -> None:
+    """三项附加内容全炸, 歌仍然要算成功, 文件仍然要在."""
+    entry = make_entry("mid1", "歌一")
+    payloads = {"M500mid1.mp3": b"x" * FULL_SIZE}
+    engine, _client, _bus, http, _auth = await build_engine(
+        repo, settings, payloads, metadata=ExplodingMetadata(),
+    )
+    task = await make_task(repo, settings, [entry])
+
+    await engine.start(task.id)
+    await engine.wait_idle()
+    await http.aclose()
+
+    item = (await repo.list_items(task.id))[0]
+    assert item.status is ItemStatus.SUCCESS, "附加内容失败不能把歌判成 failed"
+    assert item.bytes_downloaded == FULL_SIZE
+    assert Path(item.target_path).exists(), "音频文件必须留下"
+    assert item.lyric_status is SubStatus.FAILED
+
+
+# --------------------------------------------------------------------------- #
+# 翻页: 限速、可取消、不返回半截列表
+#
+# 5075 首的歌单按每页 100 算是 51 次请求。库里的 paginate() 是**连着打**的，
+# 51 次背靠背是很明显的风控特征 —— 所以页与页之间必须插限速。
+# --------------------------------------------------------------------------- #
+
+
+class FakePagedRequest:
+    """ItemPaginatedCgiRequest 替身: 固定页数, 记录每页请求的时刻."""
+
+    def __init__(self, pages: int, per_page: int = 3) -> None:
+        self.pages = pages
+        self.per_page = per_page
+        self.request_times: list[float] = []
+
+    @staticmethod
+    def items_extractor(response: Any) -> Any:
+        return response
+
+    async def paginate(self) -> Any:
+        for page in range(self.pages):
+            # 生成器被 resume 的时刻 = 这一页真正发请求的时刻.
+            self.request_times.append(time.monotonic())
+            yield [f"p{page}i{i}" for i in range(self.per_page)]
+
+
+def make_service(settings: Settings, bus: EventBus) -> Any:
+    from qmdler.core.sources.service import SourceService
+
+    return SourceService(object(), object(), settings.download, bus)  # type: ignore[arg-type]
+
+
+async def test_pagination_is_rate_limited(settings: Settings) -> None:
+    """页与页之间要等, 不能背靠背连打."""
+    settings.download.metadata_delay_min = 0.05
+    settings.download.metadata_delay_max = 0.05
+    service = make_service(settings, EventBus())
+    request = FakePagedRequest(pages=4)
+
+    collected = [item async for item in service._paginate(request, limit=100, kind="t")]
+
+    assert len(collected) == 12
+    gaps = [
+        request.request_times[i + 1] - request.request_times[i]
+        for i in range(len(request.request_times) - 1)
+    ]
+    assert gaps, "至少要翻两页才测得到间隔"
+    assert all(gap >= 0.04 for gap in gaps), f"页与页之间没有限速: {gaps}"
+
+
+async def test_pagination_can_be_cancelled_without_partial_list(settings: Settings) -> None:
+    """取消时抛异常, **不返回半截列表** —— 半截列表看着像完整的, 比拿不到更危险."""
+    settings.download.metadata_delay_min = 0.01
+    settings.download.metadata_delay_max = 0.01
+    service = make_service(settings, EventBus())
+    request = FakePagedRequest(pages=50)
+
+    from qmdler.core.sources.service import FetchCancelledError
+
+    async def collect() -> list[Any]:
+        out = []
+        async for item in service._paginate(request, limit=1000, kind="t"):
+            out.append(item)
+            if len(out) == 6:
+                service.cancel_fetch()
+        return out
+
+    with pytest.raises(FetchCancelledError):
+        await collect()
+    assert len(request.request_times) < 50, "取消之后不该继续翻页"
+
+
+async def test_pagination_emits_progress(settings: Settings) -> None:
+    """每页推一次进度, 否则界面要干等几十秒."""
+    settings.download.metadata_delay_min = 0.0
+    settings.download.metadata_delay_max = 0.0
+    bus = EventBus()
+    service = make_service(settings, bus)
+    request = FakePagedRequest(pages=3)
+
+    seen: list[dict[str, Any]] = []
+    original = bus.emit
+
+    def spy(kind: Any, payload: dict[str, Any], **kwargs: Any) -> Any:
+        seen.append(payload)
+        return original(kind, payload, **kwargs)
+
+    bus.emit = spy  # type: ignore[method-assign]
+    _ = [item async for item in service._paginate(request, limit=100, kind="songlist")]
+
+    assert [payload["loaded"] for payload in seen] == [3, 6, 9], "每翻完一页推一次"
+    assert all(payload["kind"] == "songlist" for payload in seen)

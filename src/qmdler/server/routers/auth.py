@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """登录相关端点. 五种方式并列."""
 
 from __future__ import annotations
@@ -89,6 +90,16 @@ async def start_qrcode(payload: QrStartRequest, context: Ctx) -> dict[str, Any]:
     return data
 
 
+@router.get("/qrcode/payload")
+async def qrcode_payload(context: Ctx, session_id: str = "") -> dict[str, Any]:
+    """解出二维码载荷 —— **仅诊断用途**.
+
+    依赖只在 dev 里的 ``zxing-cpp``; 没装就返回安装提示, 不影响正常登录。
+    """
+    payload, error = context.login.decode_payload(session_id)
+    return {"payload": payload, "error": error}
+
+
 @router.get("/qrcode/{session_id}")
 async def qrcode_state(session_id: str, context: Ctx) -> dict[str, Any]:
     """轮询扫码状态 (WS 断线时的退路)."""
@@ -101,10 +112,10 @@ async def qrcode_state(session_id: str, context: Ctx) -> dict[str, Any]:
 @router.get("/qrcode/{session_id}/image")
 async def qrcode_image(session_id: str, context: Ctx) -> Response:
     """二维码图片. 手机上要足够大且能长按保存, 所以单独给一张图."""
-    data = context.login.qrcode_image(session_id)
+    data, mimetype = context.login.qrcode_image(session_id)
     if not data:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "二维码不存在")
-    return Response(content=data, media_type="image/png")
+    return Response(content=data, media_type=mimetype or "image/png")
 
 
 @router.post("/qrcode/{session_id}/refresh")

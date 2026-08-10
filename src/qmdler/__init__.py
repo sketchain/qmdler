@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """qmdler — QQ 音乐歌单批量下载器.
 
 一个核心 (``core``) + 一个服务 (``server``) + 两个纯客户端前端 (``web`` / ``tui``).

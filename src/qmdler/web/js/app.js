@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 应用入口。
 //
 // Vue 3 全局构建（vue.global.prod.js）+ 组件用 JS 对象 + template 字符串编写。

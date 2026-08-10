@@ -1,0 +1,21 @@
+{
+  "data": [
+    {
+      "ekey": "",
+      "filename": "F000003hKob536i6FA003hKob536i6FA.flac",
+      "mid": "003hKob536i6FA",
+      "purl": "F000<redacted>.flac",
+      "result": 0,
+      "vkey": "<redacted:vkey>"
+    },
+    {
+      "ekey": "",
+      "filename": "F0000039MnYb0qxYhV0039MnYb0qxYhV.flac",
+      "mid": "0039MnYb0qxYhV",
+      "purl": "",
+      "result": 104003,
+      "vkey": ""
+    }
+  ],
+  "expiration": 7200
+}

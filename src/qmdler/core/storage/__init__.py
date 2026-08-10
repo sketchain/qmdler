@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """持久化子系统."""
 
 from .migrations import SCHEMA_VERSION, migrate

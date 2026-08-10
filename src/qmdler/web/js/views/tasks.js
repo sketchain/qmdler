@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 任务面板：进度、倒计时、暂停/恢复/取消、汇总报告。
 
 import { api } from '../api.js';
@@ -131,6 +132,20 @@ export const TasksView = {
             <summary>试听 / 降级（{{ store.report.trials.length }}）—— 单独计数，不混进成功</summary>
             <ul class="mono">
               <li v-for="row in store.report.trials" :key="'t'+row.id">{{ row.title }} — {{ row.reason }}</li>
+            </ul>
+          </details>
+
+          <!-- 成功但四层校验没跑全：文件是完整的，但试听检测少了一层。
+               不点出来，报告就等于在说「全部通过四层校验」。 -->
+          <details v-if="store.report.incomplete_verification.length" open>
+            <summary>
+              校验层不完整（{{ store.report.incomplete_verification.length }}）——
+              计入成功，但四层校验没跑全（完整通过 {{ store.report.fully_verified }} 首）
+            </summary>
+            <ul class="mono">
+              <li v-for="row in store.report.incomplete_verification" :key="'v'+row.id">
+                {{ row.title }} — {{ row.actual_quality }}：容器读不出时长，第 4 层未执行
+              </li>
             </ul>
           </details>
 

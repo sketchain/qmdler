@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """FastAPI 应用."""
 
 from __future__ import annotations
@@ -6,8 +7,9 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -56,6 +58,14 @@ def create_app(preset: str | None = None) -> FastAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    @app.middleware("http")
+    async def _record_public_base(request: Request, call_next: Any) -> Any:
+        """记下客户端实际用的 base —— 二维码图片地址要给一条一定打得开的。"""
+        context = getattr(app.state, "context", None)
+        if context is not None:
+            context.login.note_request_base(str(request.base_url))
+        return await call_next(request)
 
     api_routers = (health.router, auth.router, sources.router, tasks.router, config.router)
     for router in api_routers:

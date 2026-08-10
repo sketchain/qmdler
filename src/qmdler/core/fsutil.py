@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """文件系统检查."""
 
 from __future__ import annotations

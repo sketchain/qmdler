@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """把二维码图片转成终端字符画.
 
 规范里写的是「TUI 用 ``qrcode`` 库渲染终端字符二维码」, 但 ``qrcode`` 只能**编码**,
@@ -11,6 +12,14 @@
 就是渲染需要的全部信息, 不需要真正解码出载荷内容.
 
 转换在服务端完成, TUI 直接拿现成的字符画, 保持纯客户端.
+
+**还原结果必须通过两道自检才允许输出** —— 宁可报错让用户走图片/文件/载荷这三条
+退路, 也绝不打印一张可能扫不出来的图:
+
+1. **边长合法性**: 模块数必须是 ``21 + 4n`` (QR version 1~40);
+2. **定位图案**: 左上、右上、左下三个角必须匹配标准 7×7 finder pattern.
+
+中心 logo 不做特殊处理, 照原样画出 —— QR 自带的纠错会兜住.
 """
 
 from __future__ import annotations
@@ -20,10 +29,64 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_FULL = "█"  # █
-_UPPER = "▀"  # ▀
-_LOWER = "▄"  # ▄
+_FULL = "█"
+_UPPER = "▀"
+_LOWER = "▄"
 _BLANK = " "
+
+#: QR version 1~40 的合法模块数.
+VALID_SIZES: frozenset[int] = frozenset(21 + 4 * n for n in range(40))
+
+#: 标准 7×7 定位图案.
+_FINDER = [
+    [1, 1, 1, 1, 1, 1, 1],
+    [1, 0, 0, 0, 0, 0, 1],
+    [1, 0, 1, 1, 1, 0, 1],
+    [1, 0, 1, 1, 1, 0, 1],
+    [1, 0, 1, 1, 1, 0, 1],
+    [1, 0, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1, 1],
+]
+
+#: 单个定位图案允许的最大错格数. 采样落在模块边界上偶尔会差一两格,
+#: 但整块对不上就说明还原本身错了.
+_FINDER_TOLERANCE = 2
+
+
+class QrRenderError(RuntimeError):
+    """二维码还原失败, 不能输出字符画."""
+
+
+def _finder_mismatch(matrix: list[list[bool]], top: int, left: int) -> int:
+    """定位图案的错格数."""
+    mismatch = 0
+    for row in range(7):
+        for col in range(7):
+            expected = bool(_FINDER[row][col])
+            if matrix[top + row][left + col] != expected:
+                mismatch += 1
+    return mismatch
+
+
+def validate_matrix(matrix: list[list[bool]]) -> None:
+    """两道自检. 不通过就抛 :class:`QrRenderError`.
+
+    Raises:
+        QrRenderError: 边长非法, 或定位图案对不上.
+    """
+    size = len(matrix)
+    if size not in VALID_SIZES:
+        raise QrRenderError(f"还原出的模块数 {size} 不是合法的二维码边长（应为 21+4n）")
+
+    corners = {"左上": (0, 0), "右上": (0, size - 7), "左下": (size - 7, 0)}
+    bad = {
+        name: _finder_mismatch(matrix, top, left)
+        for name, (top, left) in corners.items()
+        if _finder_mismatch(matrix, top, left) > _FINDER_TOLERANCE
+    }
+    if bad:
+        detail = "、".join(f"{name}错{count}格" for name, count in bad.items())
+        raise QrRenderError(f"定位图案对不上（{detail}），还原不可靠")
 
 
 def _to_binary_matrix(data: bytes) -> list[list[bool]] | None:
@@ -97,11 +160,15 @@ def render_terminal_qr(data: bytes, *, quiet_zone: int = 2, invert: bool = False
         invert: 反色. 浅色背景的终端需要打开.
 
     Returns:
-        多行字符串; 无法解析时返回空串.
+        多行字符串.
+
+    Raises:
+        QrRenderError: 图片解析不了, 或没通过两道自检.
     """
     matrix = _to_binary_matrix(data)
     if matrix is None:
-        return ""
+        raise QrRenderError("二维码图片无法解析")
+    validate_matrix(matrix)
 
     size = len(matrix)
     padded_size = size + quiet_zone * 2
@@ -131,7 +198,27 @@ def render_terminal_qr(data: bytes, *, quiet_zone: int = 2, invert: bool = False
     return "\n".join(lines)
 
 
+def try_render(data: bytes, *, quiet_zone: int = 2, invert: bool = False) -> tuple[str, str]:
+    """渲染字符画, 不抛异常.
+
+    Returns:
+        ``(字符画, 错误说明)``. 还原失败时字符画为空串, 错误说明非空 ——
+        调用方据此提示用户改走图片端点 / 落盘文件 / 载荷文本这三条退路.
+    """
+    try:
+        return render_terminal_qr(data, quiet_zone=quiet_zone, invert=invert), ""
+    except QrRenderError as exc:
+        logger.warning("终端二维码还原失败: %s", exc)
+        return "", str(exc)
+
+
 def qr_module_count(data: bytes) -> int:
     """返回二维码的模块数 (渲染宽度估算用), 失败返回 0."""
     matrix = _to_binary_matrix(data)
     return len(matrix) if matrix else 0
+
+
+def art_width(art: str) -> int:
+    """字符画的列宽 (终端至少要这么宽才放得下)."""
+    lines = art.split("\n")
+    return len(lines[0]) if lines and lines[0] else 0

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """后端探测与自动拉起.
 
 TUI 是纯客户端. 启动时先探测后端: 探不到就在子进程里拉起一个本地服务,

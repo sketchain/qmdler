@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """SQLite 仓储层.
 
 引擎与服务层只跟这里打交道, 不直接写 SQL.
@@ -71,6 +72,7 @@ def _row_to_item(row: aiosqlite.Row) -> ItemRecord:
         lyric_status=SubStatus(row["lyric_status"]),
         cover_status=SubStatus(row["cover_status"]),
         tag_status=SubStatus(row["tag_status"]),
+        verify_incomplete=bool(row["verify_incomplete"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],

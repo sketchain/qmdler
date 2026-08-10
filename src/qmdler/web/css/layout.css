@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* 桌面宽屏: 左侧歌单树 / 中间曲目表 / 右侧任务面板 三栏. */
 
 * { box-sizing: border-box; }
@@ -224,8 +225,9 @@ table.tracks-table {
 .tracks-table .cell--title { font-weight: 600; }
 .tracks-table .cell--num { text-align: right; font-variant-numeric: tabular-nums; }
 
-/* 手机上用卡片列表代替宽表格, 默认隐藏. */
-.tracks-cards { display: none; }
+/* 表格 / 卡片二选一现在由 JS 的 matchMedia 决定（见 views/tracks.js）——
+   两种布局不会同时挂进 DOM，所以这里不再用 display:none 去藏另一种。
+   靠 CSS 藏的话，一旦 JS 与 CSS 的断点判断不一致，列表会整个空掉。 */
 
 /* ---- 进度条 ---- */
 
@@ -260,6 +262,8 @@ table.tracks-table {
   user-select: none;
 }
 .chain__label { flex: 1 1 auto; min-width: 0; }
+/* 档位告警（NAC）——选之前就要看见，所以不折叠、不省略。 */
+.chain__caveat { display: block; font-size: 12px; line-height: 1.4; color: var(--warn, #b26a00); }
 .chain__rank { font-variant-numeric: tabular-nums; color: var(--text-faint); min-width: 22px; }
 .sortable-ghost { opacity: 0.4; }
 .sortable-chosen { box-shadow: var(--shadow); }
@@ -326,3 +330,43 @@ table.tracks-table {
 }
 .toast--error { border-left-color: var(--danger); }
 .toast--warning { border-left-color: var(--warn); }
+
+/* 常驻提示条。用于「列表被截断」这类必须一直看得见的信息 ——
+   toast 一闪而过，用户会拿着不完整的列表去建任务。 */
+.banner {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius, 8px);
+  border: 1px solid transparent;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.banner--warn {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+}
+
+/* ---- 窗口化列表 ----
+   只渲染视口内的行，上下用空行/空 div 撑出滚动条高度。
+   行高必须固定，否则算不出偏移 —— 所以超长内容用省略号截断，
+   完整内容放在 title 属性里。 */
+.vlist {
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 必须是**确定**的高度：窗口化要按视口高度算渲染几行。
+     用 max-height 的话元素会塌到内容高度（此时内容只有几行），
+     于是只显示几行、下面一片空白 —— 踩过一次。
+     也不要用 contain:strict，它会连高度一起 contain 掉。 */
+  height: clamp(240px, calc(100dvh - 330px), 2000px);
+  contain: content;
+}
+.vlist .tracks-table { table-layout: fixed; }
+.tracks-table td {
+  height: 44px;
+  max-width: 0;          /* 配合 table-layout:fixed 才能让省略号生效 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tracks-table tr.vpad td { height: auto; padding: 0; border: none; }

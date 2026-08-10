@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // Service Worker：只缓存应用外壳（离线也能打开界面），API 与 WS 一律走网络。
 //
 // 下载任务是有状态的实时操作，缓存 API 响应会让 UI 显示过时状态，所以只对

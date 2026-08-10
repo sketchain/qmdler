@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """凭证与登录子系统.
 
 与下载引擎解耦: 引擎只向 :class:`AuthManager` 要一份当前有效的 Credential.

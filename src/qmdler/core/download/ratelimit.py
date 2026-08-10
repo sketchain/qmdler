@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载间隔与轻量限速.
 
 两套完全独立的节奏, 不能一刀切:

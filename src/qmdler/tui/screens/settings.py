@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """设置界面: 音质优先级链 (上下键排序)、间隔、模板预览、保存目录."""
 
 from __future__ import annotations
@@ -87,12 +88,23 @@ class SettingsScreen(ModalScreen[bool]):
                 return str(entry["label"])
         return code
 
+    def _caveat_of(self, code: str) -> str:
+        """档位告警 (目前只有 NAC). 选之前就要看见, 不是下完才发现."""
+        for entry in self._catalog:
+            if entry["code"] == code:
+                return str(entry.get("caveat") or "")
+        return ""
+
     def _refresh_chain(self) -> None:
         view = self.query_one("#chain-list", ListView)
         index = view.index or 0
         view.clear()
         for rank, code in enumerate(self._chain, start=1):
-            view.append(ListItem(Label(f"{rank}. {self._label_of(code)}")))
+            caveat = self._caveat_of(code)
+            text = f"{rank}. {self._label_of(code)}"
+            if caveat:
+                text += f"  ⚠ {caveat}"
+            view.append(ListItem(Label(text)))
         if self._chain:
             view.index = min(index, len(self._chain) - 1)
 

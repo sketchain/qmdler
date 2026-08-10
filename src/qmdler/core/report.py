@@ -1,10 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """汇总报告与 CSV 导出."""
 
 from __future__ import annotations
 
 import csv
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .models import ItemRecord, ItemStatus, TaskRecord, quality_label
@@ -29,6 +30,7 @@ CSV_COLUMNS = [
     "歌词",
     "封面",
     "标签",
+    "校验完整",
 ]
 
 STATUS_LABELS: dict[str, str] = {
@@ -51,23 +53,32 @@ class Report:
     failures: list[dict[str, Any]]
     trials: list[dict[str, Any]]
     unavailable: list[dict[str, Any]]
+    #: ``success`` 但四层校验没跑全的曲目 (如 ``.nac`` 读不出时长).
+    #: 它们**仍然计入 success** —— 文件是完整的 —— 但必须让人看见
+    #: 「这几首的试听检测少了一层」, 否则报告等于在撒谎.
+    incomplete_verification: list[dict[str, Any]] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         """转为 REST 出参."""
+        summary = (
+            f"成功 {self.counts.get('success', 0)} / "
+            f"失败 {self.counts.get('failed', 0)} / "
+            f"跳过 {self.counts.get('skipped', 0)} / "
+            f"受限 {self.counts.get('unavailable', 0)} / "
+            f"试听 {self.counts.get('trial', 0)}"
+        )
+        if self.incomplete_verification:
+            summary += f"（其中 {len(self.incomplete_verification)} 首校验层不完整）"
         return {
             "task": self.task.as_dict(),
             "counts": self.counts,
-            "summary": (
-                f"成功 {self.counts.get('success', 0)} / "
-                f"失败 {self.counts.get('failed', 0)} / "
-                f"跳过 {self.counts.get('skipped', 0)} / "
-                f"受限 {self.counts.get('unavailable', 0)} / "
-                f"试听 {self.counts.get('trial', 0)}"
-            ),
+            "summary": summary,
             "failures": self.failures,
             # 试听/降级单独成栏, 绝不混进「成功」.
             "trials": self.trials,
             "unavailable": self.unavailable,
+            "incomplete_verification": self.incomplete_verification,
+            "fully_verified": self.counts.get("success", 0) - len(self.incomplete_verification),
         }
 
 
@@ -100,6 +111,11 @@ async def build_report(repo: Repository, task_id: str) -> Report | None:
         failures=[_brief(item) for item in items if item.status is ItemStatus.FAILED],
         trials=[_brief(item) for item in items if item.status is ItemStatus.TRIAL],
         unavailable=[_brief(item) for item in items if item.status is ItemStatus.UNAVAILABLE],
+        incomplete_verification=[
+            _brief(item)
+            for item in items
+            if item.status is ItemStatus.SUCCESS and item.verify_incomplete
+        ],
     )
 
 
@@ -130,6 +146,7 @@ async def export_csv(repo: Repository, task_id: str) -> str:
                 item.lyric_status.value,
                 item.cover_status.value,
                 item.tag_status.value,
+                "否（有层未执行）" if item.verify_incomplete else "是",
             ],
         )
     return buffer.getvalue()

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """分享链接 / 各类 ID 的解析."""
 
 from __future__ import annotations

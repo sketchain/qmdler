@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """模板渲染."""
 
 from __future__ import annotations

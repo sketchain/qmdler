@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """文件名与目录模板子系统."""
 
 from .sanitize import (

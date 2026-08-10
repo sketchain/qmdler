@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """汇总报告界面."""
 
 from __future__ import annotations

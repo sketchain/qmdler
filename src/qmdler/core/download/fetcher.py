@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """取链与落盘.
 
 **本项目一律走明文播放链路, 这是有意为之.**
@@ -32,14 +33,42 @@ from .cdn import CdnManager, CdnNode
 
 logger = logging.getLogger(__name__)
 
-#: 下载中途遇到这些状态码, 说明链接失效, 需要重新取 vkey.
-STALE_LINK_STATUSES = frozenset({401, 403, 404, 410})
+#: 链接确实失效 (资源没了), 需要重新取 vkey.
+#:
+#: ⚠️ **403 不在这里, 而且不要把它加回来.** 详见下面 ``REJECT_STATUSES`` 的说明
+#: 与 ``cdn.py`` 的模块 docstring —— 那是一条实测得出、无法从代码推导的结论,
+#: 加错一次就会让每首歌多打好几次 ``get_song_urls``.
+STALE_LINK_STATUSES = frozenset({404, 410})
+
+#: 节点拒绝服务这条 purl. **不代表链接失效, 也不代表节点故障.**
+#:
+#: 实测 (2026-08, 12 首不同的歌):
+#:
+#: * dispatch 的 6 个节点用 keepalive 探针逐个探, 6/6 返回 200 → 排除节点故障;
+#: * 同一条 purl 在放行节点上可以稳定下完并逐字节校验通过 → 排除 vkey 过期;
+#: * 放行分布在 12 条不同 purl 上高度一致 (sjy6 12/12, 其余 4 个 0/12).
+#:
+#: 所以遇到 403 应当**换节点重试同一条 purl** (零额外 API 请求),
+#: 而不是当成链接失效去重新取 vkey.
+REJECT_STATUSES = frozenset({401, 403})
 
 CHUNK_SIZE = 256 * 1024
 
 
 class LinkExpiredError(RuntimeError):
     """下载途中链接失效, 需要重新取 vkey."""
+
+
+class CdnRejectedError(RuntimeError):
+    """该 CDN 节点不服务这条 purl (403), 或临时不可用 (5xx).
+
+    换一个节点用**同一条** purl 重试即可, 不需要重新取 vkey.
+    """
+
+    def __init__(self, message: str, status_code: int = 0) -> None:
+        """记录状态码, 便于诊断输出."""
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass(slots=True)
@@ -111,34 +140,64 @@ async def fetch_urls(
     return candidates
 
 
-async def probe_content_length(http: httpx.AsyncClient, url: str) -> int:
-    """下载前探一下 Content-Length.
+@dataclass(slots=True)
+class ProbeResult:
+    """下载前探测的结果. ``method`` 直接喂给 ``--single`` 的诊断输出."""
+
+    length: int = 0
+    #: ``head`` / ``range`` / ``rejected`` / ``failed``
+    method: str = "failed"
+    status_code: int = 0
+    #: 该节点拒绝服务这条 purl, 应当换节点.
+    rejected: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """是否探到了长度."""
+        return self.length > 0
+
+
+async def probe(http: httpx.AsyncClient, url: str) -> ProbeResult:
+    """下载前探一下 Content-Length, 并报告走的是哪条分支.
 
     先试 HEAD; CDN 不支持 HEAD 时退化成 ``Range: bytes=0-0`` 读 ``Content-Range``.
-    拿不到就返回 0, 由后续的实际字节数校验兜底.
+
+    实测 (2026-08): 放行的节点 HEAD 直接 200 并给出准确 Content-Length,
+    走的是 ``head`` 分支; 不放行的节点 HEAD 与 Range 都是 403, 此时返回
+    ``rejected=True``, 由调用方换节点 —— 不要当成链接失效去重新取 vkey.
     """
     try:
         response = await http.head(url, follow_redirects=True)
+        if response.status_code in REJECT_STATUSES:
+            return ProbeResult(method="rejected", status_code=response.status_code, rejected=True)
         if response.status_code < 400:
             length = response.headers.get("content-length")
-            if length and length.isdigit():
-                return int(length)
+            if length and length.isdigit() and int(length) > 0:
+                return ProbeResult(length=int(length), method="head", status_code=response.status_code)
     except httpx.HTTPError as exc:
         logger.debug("HEAD 探测失败, 改用 Range 探测: %s", exc)
 
     try:
         response = await http.get(url, headers={"Range": "bytes=0-0"}, follow_redirects=True)
+        if response.status_code in REJECT_STATUSES:
+            return ProbeResult(method="rejected", status_code=response.status_code, rejected=True)
         content_range = response.headers.get("content-range", "")
         if "/" in content_range:
             total = content_range.rsplit("/", 1)[-1]
             if total.isdigit():
-                return int(total)
+                return ProbeResult(length=int(total), method="range", status_code=response.status_code)
         length = response.headers.get("content-length")
         if response.status_code == 200 and length and length.isdigit():
-            return int(length)
+            return ProbeResult(length=int(length), method="range", status_code=response.status_code)
+        return ProbeResult(method="failed", status_code=response.status_code)
     except httpx.HTTPError as exc:
         logger.debug("Range 探测失败: %s", exc)
-    return 0
+    return ProbeResult(method="failed")
+
+
+async def probe_content_length(http: httpx.AsyncClient, url: str) -> int:
+    """只要长度的简化入口."""
+    return (await probe(http, url)).length
 
 
 async def download_file(
@@ -179,9 +238,16 @@ async def download_file(
 
     try:
         async with http.stream("GET", url, headers=headers, follow_redirects=True) as response:
+            if response.status_code in REJECT_STATUSES:
+                # 节点不给这条 purl。换节点即可，别去重新取 vkey。
+                cdn.report_rejection(node)
+                raise CdnRejectedError(f"CDN 拒绝服务 HTTP {response.status_code}", response.status_code)
             if response.status_code in STALE_LINK_STATUSES:
-                cdn.report_success(node)  # CDN 本身没问题, 是链接过期
                 raise LinkExpiredError(f"链接失效 HTTP {response.status_code}")
+            if response.status_code >= 500:
+                # 临时故障，同样换节点重试。
+                cdn.report_failure(node)
+                raise CdnRejectedError(f"CDN 暂时不可用 HTTP {response.status_code}", response.status_code)
             if response.status_code >= 400:
                 cdn.report_failure(node)
                 raise httpx.HTTPStatusError(

@@ -26,8 +26,20 @@ htmlcov/
 *.db-wal
 *.db-shm
 *.log
+
+# 凭证与设备指纹：任何位置、任何形态都不许进仓库。
+# 这几条**故意不锚定** —— 它们要在任意子目录都生效；而且仓库里不存在同名的
+# 源码文件或目录，不会像 `config/` 那样误伤打包。
 credential.json
+credential*.json
 device.json
+device*.json
+*.credential
+qrcode/
+.qmdler-probe-*
+# 诊断/抓包中间产物
+raw_*.json
+*.part
 
 # 编辑器
 .idea/

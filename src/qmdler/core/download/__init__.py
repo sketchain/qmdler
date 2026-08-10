@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载引擎子系统."""
 
 from . import errors, fetcher, state, verify

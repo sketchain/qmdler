@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """音质选择."""
 
 from __future__ import annotations

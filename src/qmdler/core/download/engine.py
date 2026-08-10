@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载引擎.
 
 硬约束 (实现过程中不为便利妥协):
@@ -17,9 +18,10 @@ import contextlib
 import logging
 import time
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from qqmusic_api import Client
@@ -28,7 +30,8 @@ from ..auth.manager import AuthManager, NotLoggedInError
 from ..config.schema import Settings
 from ..events import EventBus, EventKind
 from ..fsutil import check_space, expand
-from ..metadata.service import MetadataService
+from ..metadata.cover import EMPTY_COVER
+from ..metadata.service import ExtraTags, LyricBundle, MetadataService
 from ..metadata.tagger import TagPayload, TagWriteError, detect_duration, supports, write_tags
 from ..models import (
     ItemRecord,
@@ -38,6 +41,7 @@ from ..models import (
     TaskStatus,
     quality_extension,
     quality_label,
+    quality_start_code,
 )
 from ..naming.sanitize import dedupe_path
 from ..naming.template import RenderContext, TemplateRenderer
@@ -46,11 +50,15 @@ from ..sources.service import SourceService
 from ..storage.repository import Repository
 from . import fetcher, verify
 from .cdn import CdnManager
+from .diagnose import LayerResult, SingleDiagnosis, safe_purl
 from .errors import Action, classify, classify_result_code
 from .ratelimit import IntervalWaiter
 from .state import ActionOutcome, is_complete, resolve_action, summarize
 
 logger = logging.getLogger(__name__)
+
+#: `_best_effort` 的返回类型.
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -116,6 +124,22 @@ class DownloadEngine:
         self._pause_requested = False
         self._cancel_requested = False
         self._state = EngineState()
+        #: 最近一次探测结果与逐节点尝试记录, 供 ``--single`` 诊断输出.
+        self._last_probe = fetcher.ProbeResult()
+        self._last_probe_attempts: list[str] = []
+        #: 「本条 purl 已被哪些节点拒过」—— 键是 purl, 每首歌处理完即清空.
+        #: 绝不能把它攒到节点上跨曲目累积.
+        self._purl_rejections: dict[str, set[str]] = {}
+        #: ``--single`` 诊断记录; 为 None 表示不在诊断模式.
+        self._diagnosis: SingleDiagnosis | None = None
+        #: 诊断模式下跳过下载间隔.
+        self._skip_intervals = False
+
+    def enable_diagnosis(self) -> SingleDiagnosis:
+        """打开 ``--single`` 诊断模式: 记录四层校验的每一个实际判定值, 并跳过间隔."""
+        self._diagnosis = SingleDiagnosis()
+        self._skip_intervals = True
+        return self._diagnosis
 
     # -- 对外控制 ------------------------------------------------------------ #
 
@@ -221,8 +245,8 @@ class DownloadEngine:
                     await self._finish_task(task.id, TaskStatus.COMPLETED, "")
                     return
 
-                # 间隔: 第一首不等.
-                if not first:
+                # 间隔: 第一首不等; 诊断模式一律不等.
+                if not first and not self._skip_intervals:
                     self._state.phase = "waiting"
                     self._emit_state()
                     await self._waiter.wait()
@@ -268,8 +292,30 @@ class DownloadEngine:
         self._state.phase = "preparing"
         self._emit_state()
 
+        # 上一首的 purl 拒绝记录到此为止, 不跨曲目累积.
+        self._purl_rejections.clear()
+
         chain = task.quality_chain or self._settings.quality.chain
         plan = build_plan(entry, chain, on_all_unavailable=self._settings.quality.on_all_unavailable)
+
+        if self._diagnosis is not None:
+            begin, end, source = entry.trial_window_with_source
+            self._diagnosis.songmid = entry.songmid
+            self._diagnosis.title = entry.title
+            self._diagnosis.singers = "、".join(entry.singer_names)
+            self._diagnosis.interval = entry.interval
+            # sa 只记录不解读: 位布局无文档, 攒实测标定素材用.
+            self._diagnosis.sa = entry.sa
+            self._diagnosis.status_code = entry.status
+            self._diagnosis.pay = dict(entry.pay)
+            self._diagnosis.available_qualities = dict(entry.available_qualities)
+            self._diagnosis.quality_chain = list(chain)
+            self._diagnosis.requested_quality = plan.requested
+            self._diagnosis.requested_start_code = quality_start_code(plan.requested) if plan.requested else ""
+            self._diagnosis.size_try = entry.size_try
+            self._diagnosis.trial_window_ms = (begin, end)
+            self._diagnosis.trial_window_source = source
+            self._diagnosis.trial_windows = list(entry.trial_windows)
 
         if not plan.available:
             await self._set_item(
@@ -393,6 +439,19 @@ class DownloadEngine:
                 continue
             if not candidate.usable:
                 decision = classify_result_code(candidate.result)
+                if self._diagnosis is not None:
+                    # 拿不到 purl 也要记下来 —— 「为什么这首下不了」全靠这个 result。
+                    self._diagnosis.attempted_quality = quality
+                    self._diagnosis.result_code = candidate.result
+                    self._diagnosis.add(
+                        LayerResult(
+                            name="取链",
+                            observed=f"{quality_label(quality)} result={candidate.result}",
+                            expected="result=0 且 purl 非空",
+                            verdict="failed",
+                            detail=decision.message,
+                        ),
+                    )
                 if decision.action is Action.PAUSE_TASK:
                     self._state.pause_reason = decision.message
                     await self._set_item(
@@ -408,6 +467,27 @@ class DownloadEngine:
 
             # 第 1 层: filename 前缀比对.
             prefix_result = verify.check_prefix(quality, candidate.purl, candidate.filename)
+            if self._diagnosis is not None:
+                self._diagnosis.attempted_quality = quality
+                self._diagnosis.result_code = candidate.result
+                self._diagnosis.purl_filename = safe_purl(candidate.purl)
+                self._diagnosis.prefix_source = "purl" if verify.extract_prefix(candidate.purl) else "filename"
+                self._diagnosis.extracted_prefix = prefix_result.actual_prefix or verify.extract_prefix(
+                    candidate.purl,
+                ) or verify.extract_prefix(candidate.filename)
+                prefix_ran = verify.prefix_applicable(quality, candidate.purl, candidate.filename)
+                self._diagnosis.add(
+                    LayerResult(
+                        name="第1层 filename 前缀",
+                        observed=(
+                            f"{self._diagnosis.extracted_prefix}（取自 {self._diagnosis.prefix_source}）"
+                            if prefix_ran else "purl 与 filename 里都抠不出四字符前缀"
+                        ),
+                        expected=quality_start_code(quality) or "（该档位没有已知编码）",
+                        verdict=prefix_result.verdict.value if prefix_ran else verify.LAYER_SKIPPED,
+                        detail=prefix_result.detail or ("" if prefix_ran else "本层未执行"),
+                    ),
+                )
             if prefix_result.verdict is verify.Verdict.TRIAL and self._settings.quality.reject_trial:
                 rejected.append(f"{quality_label(quality)}: {prefix_result.detail}")
                 self._bus.log(
@@ -494,13 +574,42 @@ class DownloadEngine:
 
         expected_size = entry.available_qualities.get(quality, 0)
 
-        node = await self._cdn.pick()
-        url = self._cdn.join(node, candidate.purl)
-
-        # 第 3 层 (前置): HEAD/Range 探 Content-Length, 不合再下就是浪费 3 分钟.
+        # 选节点: 同一条 purl 依次换节点试, 不为 403 去重新取 vkey.
+        # 实测同一条 purl 在 6 个节点里往往只有 1 个放行, 其余全 403,
+        # 而所有节点的 keepalive 探针都是 200 —— 403 是节点不给这条链接,
+        # 不是链接失效.
         self._state.phase = "probing"
         self._emit_state()
-        content_length = await fetcher.probe_content_length(self._http, url)
+        node, url, probe_result = await self._select_node(candidate.purl, task=task, item=item)
+        if node is None:
+            self._bus.log(
+                f"{entry.title}：全部 {len(await self._cdn.candidates())} 个 CDN 节点都拒绝了这条链接，重新取 vkey",
+                level="warning",
+                task_id=task.id,
+                item_id=item.id,
+            )
+            credential = await self._auth.get_valid_credential()
+            fresh = await fetcher.fetch_urls(self._client, entry, [quality], credential=credential)
+            if not fresh or not fresh[0].usable:
+                return "retry_next"
+            node, url, probe_result = await self._select_node(fresh[0].purl, task=task, item=item)
+            if node is None:
+                return "retry_next"
+
+        content_length = probe_result.length
+        self._last_probe = probe_result
+
+        if self._diagnosis is not None:
+            self._diagnosis.cdn_attempts = list(self._last_probe_attempts)
+            self._diagnosis.cdn_used = node.base if node is not None else ""
+            self._diagnosis.probe_method = probe_result.method
+            self._diagnosis.probe_status = probe_result.status_code
+            self._diagnosis.content_length = content_length
+            self._diagnosis.expected_size = expected_size
+            if expected_size and content_length:
+                self._diagnosis.size_delta_pct = round(
+                    abs(content_length - expected_size) / expected_size * 100, 3,
+                )
 
         pre_checks = [
             prefix_result,
@@ -508,6 +617,39 @@ class DownloadEngine:
             verify.check_size(expected_size, content_length, tolerance=settings.quality.size_tolerance),
         ]
         pre_result = verify.combine(*pre_checks)
+        if self._diagnosis is not None:
+            delta = self._diagnosis.size_delta_pct
+            delta_note = f"差异 {delta}%" if delta is not None else ""
+            self._diagnosis.add(
+                LayerResult(
+                    name="第2层 试听片段绝对大小基准（size_try）",
+                    observed=f"探到 {content_length} 字节",
+                    expected=(
+                        f"≠ size_try={entry.size_try}（试听片段的绝对大小基准，"
+                        f"不是本曲正片的特征值；落在其 ±"
+                        f"{settings.quality.size_tolerance:.0%} 内即判 trial）"
+                        if entry.size_try > 0 else "该曲目没有 size_try，无基准可比"
+                    ),
+                    verdict=(
+                        pre_checks[1].verdict.value
+                        if verify.trial_size_applicable(entry, content_length)
+                        else verify.LAYER_SKIPPED
+                    ),
+                    detail=pre_checks[1].detail or (
+                        "" if verify.trial_size_applicable(entry, content_length) else "本层未执行"
+                    ),
+                ),
+            )
+            size_ran = verify.size_applicable(expected_size, content_length)
+            self._diagnosis.add(
+                LayerResult(
+                    name="第3层 Content-Length vs size_*（下载前）",
+                    observed=f"{content_length} 字节（{probe_result.method} 分支，HTTP {probe_result.status_code}）",
+                    expected=f"{expected_size} 字节" if expected_size > 0 else "该档位没有声明大小",
+                    verdict=pre_checks[2].verdict.value if size_ran else verify.LAYER_SKIPPED,
+                    detail=(pre_checks[2].detail or delta_note) if size_ran else "本层未执行",
+                ),
+            )
         if pre_result.verdict is verify.Verdict.TRIAL and settings.quality.reject_trial:
             self._bus.log(
                 f"{entry.title}：下载前检出试听（{pre_result.detail}），跳过该档位",
@@ -541,8 +683,29 @@ class DownloadEngine:
                 on_progress=on_progress,
                 cancelled=lambda: self._cancel_requested,
             )
+        except fetcher.CdnRejectedError as exc:
+            # 下到一半节点翻脸 (403/5xx): 换节点用同一条 purl 续传, 不重新取 vkey.
+            self._bus.log(
+                f"{entry.title}：CDN 中途拒绝（{exc}），换节点续传",
+                level="info",
+                task_id=task.id,
+                item_id=item.id,
+            )
+            node, url, _ = await self._select_node(candidate.purl, task=task, item=item, skip=node)
+            if node is None:
+                raise
+            outcome = await fetcher.download_file(
+                self._http,
+                url,
+                target,
+                node=node,
+                cdn=self._cdn,
+                expected_size=expected_size,
+                on_progress=on_progress,
+                cancelled=lambda: self._cancel_requested,
+            )
         except fetcher.LinkExpiredError:
-            # 403 / 链接失效: 重新取一次 vkey 续传, 不计入失败次数.
+            # 404/410: 链接是真没了, 这时才值得重新取一次 vkey 续传.
             self._bus.log(
                 f"{entry.title}：下载链接失效，重新取 vkey 续传",
                 level="info",
@@ -553,8 +716,9 @@ class DownloadEngine:
             fresh = await fetcher.fetch_urls(self._client, entry, [quality], credential=credential)
             if not fresh or not fresh[0].usable:
                 raise
-            node = await self._cdn.pick()
-            url = self._cdn.join(node, fresh[0].purl)
+            node, url, _ = await self._select_node(fresh[0].purl, task=task, item=item)
+            if node is None:
+                raise
             outcome = await fetcher.download_file(
                 self._http,
                 url,
@@ -569,15 +733,101 @@ class DownloadEngine:
         # 第 3 / 4 层: 落盘后的字节数与时长.
         self._state.phase = "verifying"
         self._emit_state()
+        actual_duration = detect_duration(outcome.path)
         post_result = verify.combine(
             verify.check_trial_size(entry, outcome.bytes_written, tolerance=settings.quality.size_tolerance),
             verify.check_size(expected_size, outcome.bytes_written, tolerance=settings.quality.size_tolerance),
             verify.check_duration(
                 entry,
-                detect_duration(outcome.path),
+                actual_duration,
                 tolerance=settings.quality.duration_tolerance,
             ),
         )
+        if actual_duration <= 0:
+            # 读不出时长, 第 4 层等于没跑. 说出来 —— 静默少一层校验正是本项目最怕的事.
+            self._bus.log(
+                f"{entry.title}：{target.suffix} 容器读不出时长，第 4 层时长校验未执行，"
+                f"试听检测只剩前三层",
+                level="warning",
+                task_id=task.id,
+                item_id=item.id,
+            )
+
+        if self._diagnosis is not None:
+            duration = actual_duration
+            self._diagnosis.downloaded_bytes = outcome.bytes_written
+            self._diagnosis.actual_duration = round(duration, 2)
+            post_size_ran = verify.size_applicable(expected_size, outcome.bytes_written)
+            self._diagnosis.add(
+                LayerResult(
+                    name="第3层 实际字节数 vs size_*（落盘后）",
+                    observed=f"{outcome.bytes_written} 字节",
+                    expected=f"{expected_size} 字节" if expected_size > 0 else "该档位没有声明大小",
+                    verdict=(
+                        verify.check_size(
+                            expected_size, outcome.bytes_written,
+                            tolerance=settings.quality.size_tolerance,
+                        ).verdict.value
+                        if post_size_ran else verify.LAYER_SKIPPED
+                    ),
+                    detail="" if post_size_ran else "本层未执行",
+                ),
+            )
+            duration_check = verify.check_duration(
+                entry, duration, tolerance=settings.quality.duration_tolerance,
+            )
+            duration_ran = verify.duration_applicable(entry, duration)
+            if duration_ran:
+                duration_verdict = duration_check.verdict.value
+                duration_note = duration_check.detail
+            elif entry.interval <= 0:
+                # 连基准都没有, 无从比起 —— 正常情况, 不用担心.
+                duration_verdict = verify.LAYER_SKIPPED
+                duration_note = "本层未执行：该曲目没有 interval"
+            else:
+                # 基准有、数据拿不到 —— 这首歌确实少了一层校验, 要担心.
+                duration_verdict = verify.LAYER_UNVERIFIED
+                duration_note = "本层未能执行，试听检测只剩前三层"
+            self._diagnosis.add(
+                LayerResult(
+                    name="第4层 实际时长 vs interval",
+                    observed=(
+                        f"{duration:.1f}s" if duration > 0
+                        else f"读不出时长（{target.suffix} 容器 mutagen 不支持）"
+                    ),
+                    expected=f"{entry.interval}s" if entry.interval > 0 else "该曲目没有 interval",
+                    # 读不出时长 ≠ 校验通过. 标成 ok 会让人以为第 4 层跑过了.
+                    verdict=duration_verdict,
+                    detail=duration_note,
+                ),
+            )
+            # 窗口比对是第 4 层里独立的一半: 两组窗口都缺席时它同样没跑.
+            # 先看窗口再看时长 —— 窗口都没有的话, 有没有时长都无从比起.
+            windows = entry.trial_windows
+            if not windows:
+                window_verdict = verify.LAYER_SKIPPED
+                window_note = "本层未执行：file 与 vi 两组窗口都没有"
+            elif duration <= 0:
+                window_verdict = verify.LAYER_UNVERIFIED
+                window_note = "本层未能执行：读不出时长"
+            elif duration_check.verdict is verify.Verdict.TRIAL:
+                window_verdict = duration_check.verdict.value
+                window_note = duration_check.detail
+            else:
+                window_verdict = "ok"
+                window_note = ""
+            self._diagnosis.add(
+                LayerResult(
+                    name="第4层 实际时长 vs 试听窗口",
+                    observed=f"{duration:.1f}s" if duration > 0 else "读不出时长",
+                    expected=(
+                        "、".join(f"{b}~{e}ms（{src}）" for b, e, src in windows)
+                        if windows else "该曲目 file 与 vi 两组窗口都没有"
+                    ),
+                    verdict=window_verdict,
+                    detail=window_note,
+                ),
+            )
 
         if post_result.verdict is verify.Verdict.TRIAL:
             return await self._handle_trial(task, item, entry, quality, outcome.path, target, post_result)
@@ -605,6 +855,9 @@ class DownloadEngine:
             lyric_status=lyric_status,
             cover_status=cover_status,
             tag_status=tag_status,
+            # 读不出时长 = 第 4 层没跑成. 记下来, 汇总报告要把它从
+            # 「已完成四层校验」里摘出去.
+            verify_incomplete=actual_duration <= 0,
             error_message="",
             finished_at=int(time.time()),
         )
@@ -619,6 +872,49 @@ class DownloadEngine:
             item_id=item.id,
         )
         return "done"
+
+    async def _select_node(
+        self,
+        purl: str,
+        *,
+        task: TaskRecord,
+        item: ItemRecord,
+        skip: Any = None,
+    ) -> tuple[Any, str, fetcher.ProbeResult]:
+        """依次探测候选节点, 返回第一个愿意服务这条 purl 的.
+
+        探测本身就是第 3 层校验的前置 HEAD/Range, 所以这里顺带把长度也拿回来,
+        不额外多打一次请求.
+
+        「已经拒过这条 purl 的节点」记在 :attr:`_purl_rejections` 里, 键是 purl,
+        换歌就丢 —— 不跨曲目累积. 节点级只留连通性与「最近是否成功过」.
+
+        Returns:
+            ``(节点, 完整 URL, 探测结果)``; 全部拒绝时节点为 ``None``.
+        """
+        rejected_for_purl = self._purl_rejections.setdefault(purl, set())
+        if skip is not None:
+            rejected_for_purl.add(skip.base)
+
+        attempts: list[str] = []
+        for node in await self._cdn.candidates(exclude=rejected_for_purl):
+            url = self._cdn.join(node, purl)
+            result = await fetcher.probe(self._http, url)
+            attempts.append(f"{node.base}→{result.method}/{result.status_code}")
+            if result.rejected:
+                rejected_for_purl.add(node.base)
+                self._cdn.report_rejection(node)
+                continue
+            if result.method == "failed":
+                rejected_for_purl.add(node.base)
+                self._cdn.report_failure(node)
+                continue
+            self._last_probe_attempts = attempts
+            return node, url, result
+
+        self._last_probe_attempts = attempts
+        logger.info("全部 CDN 节点拒绝该 purl: %s", "; ".join(attempts))
+        return None, "", fetcher.ProbeResult()
 
     async def _handle_trial(
         self,
@@ -666,17 +962,36 @@ class DownloadEngine:
         quality: str,
         task: TaskRecord,
     ) -> tuple[SubStatus, SubStatus, SubStatus]:
-        """歌词 / 封面 / tag. 任何一项失败都不让整首歌算失败."""
+        """歌词 / 封面 / tag. **任何一项失败都不让整首歌算失败.**
+
+        这里的 ``_best_effort`` 不是防御性编程的摆设: 实测撞到过一次
+        ``song.get_producer`` 抛 pydantic ``ValidationError``
+        (上游模型的 ``Lst`` 字段没标 Optional, 服务端回 ``null`` 就炸),
+        结果**整首歌被记成 failed** —— 音频明明已经完整落盘了.
+        附加内容是锦上添花, 拿不到就标一下, 绝不能拖垮主流程.
+        """
         settings = self._settings
         self._state.phase = "metadata"
         self._emit_state()
 
-        lyric_bundle = await self._metadata.fetch_lyric(entry, settings.lyric)
+        lyric_bundle = await self._best_effort(
+            self._metadata.fetch_lyric(entry, settings.lyric),
+            what="歌词",
+            entry=entry,
+            task=task,
+            fallback=LyricBundle(status=SubStatus.FAILED),
+        )
         if lyric_bundle.status is SubStatus.OK:
             with contextlib.suppress(OSError):
                 self._metadata.write_lyric_files(lyric_bundle, path, settings.lyric)
 
-        embed_cover = await self._metadata.fetch_cover(entry, settings.cover, for_embed=True)
+        embed_cover = await self._best_effort(
+            self._metadata.fetch_cover(entry, settings.cover, for_embed=True),
+            what="封面",
+            entry=entry,
+            task=task,
+            fallback=EMPTY_COVER,
+        )
         cover_status = SubStatus.SKIPPED
         if settings.cover.enabled:
             cover_status = SubStatus.OK if embed_cover.ok else SubStatus.FAILED
@@ -684,14 +999,26 @@ class DownloadEngine:
                 save_cover = (
                     embed_cover
                     if settings.cover.save_size == settings.cover.embed_size
-                    else await self._metadata.fetch_cover(entry, settings.cover, for_embed=False)
+                    else await self._best_effort(
+                        self._metadata.fetch_cover(entry, settings.cover, for_embed=False),
+                        what="封面",
+                        entry=entry,
+                        task=task,
+                        fallback=EMPTY_COVER,
+                    )
                 )
                 if save_cover.ok:
                     name = settings.cover.file_name or "cover.jpg"
                     with contextlib.suppress(OSError):
                         self._metadata.write_cover_file(save_cover, path.parent / name)
 
-        extra = await self._metadata.fetch_extra_tags(entry, settings.tag)
+        extra = await self._best_effort(
+            self._metadata.fetch_extra_tags(entry, settings.tag),
+            what="作曲/作词/流派",
+            entry=entry,
+            task=task,
+            fallback=ExtraTags(),
+        )
 
         tag_status = SubStatus.SKIPPED
         if settings.tag.enabled:
@@ -723,6 +1050,34 @@ class DownloadEngine:
 
         return lyric_bundle.status, cover_status, tag_status
 
+    async def _best_effort(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        what: str,
+        entry: Any,
+        task: TaskRecord,
+        fallback: _T,
+    ) -> _T:
+        """跑一个附加内容的获取, 出任何岔子都吞掉并返回兜底值.
+
+        这里**故意捕获 Exception 而不是某几个具体类型**: 附加内容的失败模式
+        来自上游模型与服务端返回的组合, 列不全 (实测就撞到过 pydantic 的
+        ``ValidationError``, 它既不是 ``BaseApiException`` 也不是网络错误).
+        音频已经完整落盘了, 没有任何理由让一个可选字段把它拖成 failed.
+        ``CancelledError`` 不在此列 —— 它不是 ``Exception`` 的子类, 会正常传上去.
+        """
+        try:
+            return await awaitable
+        except Exception as exc:  # 见 docstring: 附加内容绝不拖垮主流程
+            logger.warning("获取%s失败 %s: %s", what, getattr(entry, "songmid", "?"), exc)
+            self._bus.log(
+                f"{getattr(entry, 'title', '?')}：{what}获取失败，已跳过 — {type(exc).__name__}",
+                level="warning",
+                task_id=task.id,
+            )
+            return fallback
+
     # -- 收尾与状态 ----------------------------------------------------------- #
 
     async def _finish_task(self, task_id: str, status: TaskStatus, reason: str) -> None:
@@ -751,6 +1106,11 @@ class DownloadEngine:
         emit_only: bool = False,
         **fields: Any,
     ) -> None:
+        if self._diagnosis is not None and status is not ItemStatus.DOWNLOADING:
+            self._diagnosis.verdict = status.value
+            self._diagnosis.reason = str(
+                fields.get("error_message") or fields.get("trial_reason") or "",
+            )
         if not emit_only:
             await self._repo.update_item(item.id, status=status, **fields)
         refreshed = await self._repo.get_item(item.id)

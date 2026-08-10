@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """异常 → 动作 的映射.
 
 按库的异常体系分类处理, 不允许一个 ``except Exception`` 糊过去.

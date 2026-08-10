@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """TUI 响应式布局与模态框.
 
 不需要真后端: 指向一个不存在的地址, TUI 应该照常挂载并把连接失败写进日志.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """领域模型.
 
 这里定义的是 qmdler 自己的内部模型, 与 ``qqmusic_api`` 的响应模型解耦:
@@ -42,6 +43,22 @@ QUALITY_TABLE: dict[str, tuple[str, tuple[str, int] | str]] = {
     "ACC_96": ("流畅 AAC 96k (可能为试听)", "size_96aac"),
     "ACC_48": ("低品质 AAC 48k", "size_48aac"),
 }
+
+#: 档位级别的告警, 选之前就要让用户看见, 而不是下完才发现.
+#:
+#: ``NAC`` (``TL01``, ``.nac``) 是腾讯自研容器. 实测 (2026-08):
+#: ``ffprobe`` / ``ffmpeg`` 一律 ``Invalid data found when processing input``,
+#: mutagen 既读不出时长也写不了 tag —— 普通播放器、元数据、时长校验三样全废.
+#: 文件本身能下下来 (字节数与 ``size_new[7]`` 一致), 但基本没法用.
+QUALITY_CAVEATS: dict[str, str] = {
+    "NAC": "普通播放器不识别；不支持元数据写入与时长校验（第 4 层校验会被跳过）",
+}
+
+
+def quality_caveat(code: str) -> str:
+    """该档位的告警文案, 没有则为空串."""
+    return QUALITY_CAVEATS.get(code, "")
+
 
 #: 默认优先级链 (从高到低). 不含加密档位 —— 加密档位下载下来无法播放.
 DEFAULT_QUALITY_CHAIN: list[str] = [
@@ -269,17 +286,38 @@ class SongEntry:
         return self.status == 3
 
     @property
-    def trial_window_ms(self) -> tuple[int, int]:
-        """试听片段的 (开始, 结束) 毫秒.
+    def trial_windows(self) -> list[tuple[int, int, str]]:
+        """全部已知的试听窗口 ``(开始ms, 结束ms, 来源)``.
 
-        优先用 ``file.try_begin`` / ``try_end``; 缺失时回退到 ``vi[4]`` / ``vi[5]``,
-        两者互为佐证.
+        ``file.try_begin/try_end`` 与 ``vi[4]/vi[5]`` **不是主备关系, 而是两个
+        并列候选**. 实测「晴天」: ``file`` 给 84346~142843ms (58.5s), ``vi`` 给
+        84346~114346ms (30s) —— 差距太大, 不像取整误差, 更像是不同档位各有各的
+        试听区间.
+
+        所以两个都要留着, 时长校验时**任意一个命中就判 trial**. 漏判 trial 正是
+        这个项目最怕的方向, 不能因为选了其中一个就对另一个视而不见.
         """
-        begin, end = self.try_begin_ms, self.try_end_ms
-        if end <= begin:
-            begin = self.vi[4] if len(self.vi) > 4 else 0
-            end = self.vi[5] if len(self.vi) > 5 else 0
-        return begin, end
+        windows: list[tuple[int, int, str]] = []
+        if self.try_end_ms > self.try_begin_ms:
+            windows.append((self.try_begin_ms, self.try_end_ms, "file.try_begin/try_end"))
+        if len(self.vi) > 5:
+            begin, end = self.vi[4], self.vi[5]
+            if end > begin and (begin, end) != (self.try_begin_ms, self.try_end_ms):
+                windows.append((begin, end, "vi[4]/vi[5]"))
+        return windows
+
+    @property
+    def trial_window_ms(self) -> tuple[int, int]:
+        """展示用的默认窗口 (``file`` 优先). **判定不要只用这一个**, 见
+        :attr:`trial_windows`."""
+        windows = self.trial_windows
+        return (windows[0][0], windows[0][1]) if windows else (0, 0)
+
+    @property
+    def trial_window_with_source(self) -> tuple[int, int, str]:
+        """展示用的默认窗口及其来源. 判定请用 :attr:`trial_windows`."""
+        windows = self.trial_windows
+        return windows[0] if windows else (0, 0, "(无)")
 
     @property
     def replaygain(self) -> tuple[float, float] | None:
@@ -478,6 +516,9 @@ class ItemRecord:
     lyric_status: SubStatus
     cover_status: SubStatus
     tag_status: SubStatus
+    #: 四层校验里有层没跑成 (如 ``.nac`` 读不出时长). ``success`` 但校验不完整,
+    #: 汇总报告要单列, 否则会给出「全部通过四层校验」的假象.
+    verify_incomplete: bool
     created_at: int
     updated_at: int
     started_at: int | None = None
@@ -522,6 +563,7 @@ class ItemRecord:
             "lyric_status": self.lyric_status.value,
             "cover_status": self.cover_status.value,
             "tag_status": self.tag_status.value,
+            "verify_incomplete": self.verify_incomplete,
             "pay_flags": self.entry.pay,
             "available_qualities": self.entry.available_qualities,
             "started_at": self.started_at,

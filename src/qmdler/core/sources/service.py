@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """歌单来源.
 
 八种来源统一产出 ``list[SongEntry]``.
 
 **分页必须翻完**, 但必须带 limit: 这些接口都是 ``ItemPaginatedCgiRequest``,
-``.collect_items(limit=N)`` 会自动跨页展开, 不设 limit 就是无限拉.
+库自带的跨页展开不设 limit 就是无限拉.
+
+翻页一律走 :meth:`SourceService._paginate` —— 它在页与页之间插限速、支持取消、
+每页推进度. 库自带的那个一次性收集器会把几十页**背靠背**打完, 不要直接用.
 
 **关于 query_song**: 列表接口返回的已经是完整的 ``Song`` 对象 —— ``Song.file`` /
 ``Song.pay`` 在模型上是必填字段, 所以 ``size_*`` / ``media_mid`` / ``interval`` /
@@ -17,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,6 +32,7 @@ from qqmusic_api.modules.song import SongQueryInfo
 
 from ..auth.manager import AuthManager
 from ..config.schema import DownloadConfig
+from ..events import EventBus, EventKind
 from ..models import SongEntry, SourceType, from_api_song
 
 logger = logging.getLogger(__name__)
@@ -36,11 +42,27 @@ logger = logging.getLogger(__name__)
 #: 所以我们自己分批.
 QUERY_SONG_MAX_MIDS = 100
 
-#: 各来源的默认拉取上限. 超过 1000 首的歌单不能只拿第一页, 但也不能无限拉.
-DEFAULT_LIMIT = 2000
+#: 各来源的拉取上限. 不能只拿第一页, 但也不能无限拉.
+#:
+#: **默认值即上限**, 两者是同一个常量 —— REST 的 ``Field(default=…, le=…)``
+#: 直接引用它, 不在两处各写一个数.
+#:
+#: 为什么是 10000 而不是更小: 这个工具就是给歌单批量归档用的, 五千首级别的
+#: 歌单不罕见 (实测的收藏歌单就有 5075 首). 默认吃不下, 主要场景就不成立.
+#: 而截断的代价是**用户以为下完了整个歌单, 实际少了几千首, 可能几个月后才发现**——
+#: 这比"误点一次多翻几十页"严重得多, 何况翻页已经带限速 (5000 首约 80 秒)
+#: 且随时可以取消.
+#:
+#: ⚠️ 即便 10000 也仍可能被更大的歌单撑爆, 所以 :class:`SourceResult` 的
+#: ``truncated`` 与真实 ``total`` 必须保留, 两个前端都要**常驻**显示.
+DEFAULT_LIMIT = 10000
 
 #: 每页条数. 太小会翻很多页 (每页一次请求), 太大容易被判异常.
 PAGE_SIZE = 100
+
+
+class FetchCancelledError(RuntimeError):
+    """拉取被用户取消. 不返回半截列表 —— 半截列表比没有更危险."""
 
 
 @dataclass(slots=True)
@@ -76,11 +98,14 @@ class SourceService:
         client: Client,
         auth: AuthManager,
         download_config: DownloadConfig,
+        bus: EventBus | None = None,
     ) -> None:
         """初始化."""
         self._client = client
         self._auth = auth
         self._config = download_config
+        self._bus = bus
+        self._cancel_requested = False
 
     # -- 轻量限速 ------------------------------------------------------------ #
 
@@ -89,6 +114,66 @@ class SourceService:
         delay = random.uniform(self._config.metadata_delay_min, self._config.metadata_delay_max)
         if delay > 0:
             await asyncio.sleep(delay)
+
+    # -- 取消 ---------------------------------------------------------------- #
+
+    def cancel_fetch(self) -> None:
+        """请求取消当前的拉取. 下一个翻页检查点生效.
+
+        **要广播** —— 「任一端的操作对另一端立即可见」也包括这个: 不推的话
+        另一端还停在「正在拉取…」上干等.
+
+        ⚠️ 取消是**服务级**的: 两个前端同时在拉时, 任何一端点取消都会把两边
+        都掐掉. 本工具是单用户本地服务, 这个取舍可以接受, 但别当成没有.
+        """
+        self._cancel_requested = True
+        if self._bus is not None:
+            self._bus.emit(EventKind.SOURCE_PROGRESS, {"cancelled": True, "done": True})
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested:
+            raise FetchCancelledError("拉取已取消")
+
+    # -- 翻页 ---------------------------------------------------------------- #
+
+    async def _paginate(
+        self,
+        request: Any,
+        *,
+        limit: int,
+        kind: str,
+        name: str = "",
+    ) -> AsyncIterator[Any]:
+        """跨页迭代**单条**数据项, 并在页与页之间做三件事.
+
+        1. **限速**: ``paginate()`` 自己是连着打的 —— 5075 首的歌单按每页 100 算
+           就是 51 次背靠背的请求, 是很明显的风控特征. 这里在**请求下一页之前**
+           插入与元数据请求同一套的轻量延迟 (生成器是惰性的, 所以在循环末尾
+           await 就等于在下一次请求之前 await).
+        2. **可取消**: 51 页耗时不短, 用户必须能中断. 取消时抛
+           :class:`FetchCancelledError`, **不返回半截列表**.
+        3. **报进度**: 每页推一次, 否则界面要干等几十秒不知道发生了什么.
+        """
+        self._cancel_requested = False
+        yielded = 0
+        async for response in request.paginate():
+            self._check_cancelled()
+            items = request.items_extractor(response) or []
+            for item in items:
+                if yielded >= limit:
+                    return
+                yield item
+                yielded += 1
+            if yielded >= limit:
+                return
+            if self._bus is not None:
+                self._bus.emit(
+                    EventKind.SOURCE_PROGRESS,
+                    {"kind": kind, "name": name, "loaded": yielded, "done": False},
+                )
+            # 惰性生成器: 这里 await 就是在「请求下一页」之前 await.
+            await self._metadata_delay()
+            self._check_cancelled()
 
     # -- 账号相关 ------------------------------------------------------------ #
 
@@ -112,10 +197,17 @@ class SourceService:
         ]
 
     async def fav_songlists(self, limit: int = 200) -> list[dict[str, Any]]:
-        """账号收藏的他人歌单. 需要 euin."""
+        """账号收藏的他人歌单. 需要 euin.
+
+        走 :meth:`_paginate` 而不是 ``collect_items`` —— 后者会把几页背靠背打完,
+        与其它来源不一致. 页数少不是免限速的理由.
+        """
         euin = await self._require_euin()
         request = self._client.user.get_fav_songlist(euin, page=1, num=PAGE_SIZE)
-        items = await request.collect_items(limit=limit)
+        items = [
+            item
+            async for item in self._paginate(request, limit=limit, kind="fav_songlist", name="收藏歌单")
+        ]
         return [
             {
                 "id": item.id,
@@ -145,8 +237,10 @@ class SourceService:
         """「我喜欢」(内部 dirid=201)."""
         euin = await self._require_euin()
         request = self._client.user.get_fav_song(euin, page=1, num=PAGE_SIZE)
-        songs = await request.collect_items(limit=limit)
-        entries = [from_api_song(song) for song in songs]
+        entries = [
+            from_api_song(song)
+            async for song in self._paginate(request, limit=limit, kind="fav_song", name="我喜欢")
+        ]
         return SourceResult(
             source_type=SourceType.FAV_SONG,
             identifier="201",
@@ -158,13 +252,16 @@ class SourceService:
 
     async def from_songlist(self, songlist_id: int, limit: int = DEFAULT_LIMIT) -> SourceResult:
         """歌单 ID / 分享链接."""
+        self._cancel_requested = False
         request = self._client.songlist.get_detail(songlist_id, num=PAGE_SIZE, page=1)
         # 用 paginate() 单趟走完: 既拿到每页的歌, 也顺手取到第一页里的歌单名和总数,
-        # 不额外多打一次第一页.
+        # 不额外多打一次第一页. 这条不能复用 _paginate() —— 它还要顺手取歌单名与
+        # 服务端声明的 total, 所以在这里把限速/取消/进度三件事重做一遍.
         entries: list[SongEntry] = []
         title = ""
         total = 0
         async for response in request.paginate():
+            self._check_cancelled()
             if not title:
                 title = response.info.title
                 total = response.total
@@ -172,6 +269,14 @@ class SourceService:
             if len(entries) >= limit:
                 del entries[limit:]
                 break
+            if self._bus is not None:
+                self._bus.emit(
+                    EventKind.SOURCE_PROGRESS,
+                    {"kind": "songlist", "name": title, "loaded": len(entries),
+                     "total": total, "done": False},
+                )
+            await self._metadata_delay()
+            self._check_cancelled()
         return SourceResult(
             source_type=SourceType.SONGLIST,
             identifier=str(songlist_id),
@@ -183,8 +288,11 @@ class SourceService:
 
     async def from_album(self, album: str | int, limit: int = DEFAULT_LIMIT) -> SourceResult:
         """专辑."""
-        songs = await self._client.album.get_song(album, num=PAGE_SIZE, page=1).collect_items(limit=limit)
-        entries = [from_api_song(song) for song in songs]
+        request = self._client.album.get_song(album, num=PAGE_SIZE, page=1)
+        entries = [
+            from_api_song(song)
+            async for song in self._paginate(request, limit=limit, kind="album", name=str(album))
+        ]
         name = entries[0].album_name if entries else str(album)
         return SourceResult(
             source_type=SourceType.ALBUM,
@@ -197,8 +305,11 @@ class SourceService:
 
     async def from_singer(self, singer_mid: str, limit: int = DEFAULT_LIMIT) -> SourceResult:
         """歌手全部作品."""
-        songs = await self._client.singer.get_songs_list(singer_mid, num=PAGE_SIZE, page=1).collect_items(limit=limit)
-        entries = [from_api_song(song) for song in songs]
+        request = self._client.singer.get_songs_list(singer_mid, num=PAGE_SIZE, page=1)
+        entries = [
+            from_api_song(song)
+            async for song in self._paginate(request, limit=limit, kind="singer", name=singer_mid)
+        ]
         name = entries[0].singer_names[0] if entries and entries[0].singer_names else singer_mid
         return SourceResult(
             source_type=SourceType.SINGER,
@@ -211,13 +322,17 @@ class SourceService:
 
     async def from_search(self, keyword: str, limit: int = 200) -> SourceResult:
         """搜索结果."""
-        songs = await self._client.search.search_by_type(
+        request = self._client.search.search_by_type(
             keyword,
             SearchType.SONG,
             num=min(PAGE_SIZE, 50),
             page=1,
-        ).collect_items(limit=limit)
-        entries = [from_api_song(song) for song in songs if hasattr(song, "mid")]
+        )
+        entries = [
+            from_api_song(song)
+            async for song in self._paginate(request, limit=limit, kind="search", name=keyword)
+            if hasattr(song, "mid")
+        ]
         return SourceResult(
             source_type=SourceType.SEARCH,
             identifier=keyword,

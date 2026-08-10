@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """日志配置: 控制台 (Rich) + 可选文件轮转."""
 
 from __future__ import annotations
@@ -9,6 +10,7 @@ from pathlib import Path
 from rich.logging import RichHandler
 
 from .core.config.schema import LogConfig
+from .core.redact import RedactingFilter
 
 _CONFIGURED = False
 
@@ -27,9 +29,14 @@ def setup_logging(config: LogConfig, *, console: bool = True) -> None:
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
+    # 脱敏挂在 handler 上而不是 logger 上: logger 级的 filter 不会作用于
+    # 子 logger 传上来的记录, 挂 handler 才能覆盖全部输出.
+    redactor = RedactingFilter()
+
     if console:
         rich_handler = RichHandler(rich_tracebacks=True, show_path=False, omit_repeated_times=False)
         rich_handler.setFormatter(logging.Formatter("%(message)s", datefmt="%H:%M:%S"))
+        rich_handler.addFilter(redactor)
         root.addHandler(rich_handler)
 
     if config.file:
@@ -44,6 +51,7 @@ def setup_logging(config: LogConfig, *, console: bool = True) -> None:
         file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s"),
         )
+        file_handler.addFilter(redactor)
         root.addHandler(file_handler)
 
     if not console and not config.file:

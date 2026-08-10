@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // REST 客户端。WebUI 与 TUI 调用的是同一组端点。
 
 const BASE = '/api';

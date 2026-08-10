@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 登录：五种方式并列可选。
 
 import { api } from '../api.js';

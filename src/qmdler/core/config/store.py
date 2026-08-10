@@ -1,9 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置读写与预设管理.
 
-优先级 (低 → 高): 内置默认 → TOML 文件 → 选中的预设 → 环境变量.
+优先级 (低 → 高): **内置默认 → TOML 文件 → 环境变量**.
 
 环境变量最高是有意的: 容器部署时用 ``QMDLER_SERVER__PORT`` 之类覆盖文件里的值,
-不需要重新烘一个镜像.
+不需要重新烘一个镜像. (这条曾经只写在文档里而没有实现, 见
+``Settings.settings_customise_sources``.)
+
+**预设不在这条链上.** 它是「一次性把一批值写进配置文件」, 不是运行时叠加层 ——
+:meth:`ConfigStore.activate_preset` 会把预设的值合并进文件再落盘, 之后 ``preset``
+只是个标签, 文件就是唯一事实.
+
+为什么不做成运行时叠加: 那样的话预设覆盖到的字段会被**永久遮住** ——
+用户在设置界面改了音质链、保存、界面却弹回旧值, 而且完全看不出为什么.
+一次性写入既满足「一键切换」, 又不会让后续修改凭空失效.
 """
 
 from __future__ import annotations
@@ -92,21 +102,34 @@ class ConfigStore:
         return _read_toml(self.config_path)
 
     def load(self, preset: str | None = None) -> Settings:
-        """加载配置.
+        """加载配置: 文件 + 环境变量 (环境变量优先, 见模块 docstring).
 
         Args:
-            preset: 强制使用的预设名; 缺省读配置文件里的 ``preset`` 字段.
+            preset: 只用来**临时切换**并落盘 (等价于调一次
+                :meth:`activate_preset`); 缺省就按文件里的值加载, 不做叠加.
+        """
+        if preset is not None and preset != (self.raw().get("preset") or "default"):
+            return self.activate_preset(preset)
+        return Settings(**self.raw())
+
+    def activate_preset(self, name: str) -> Settings:
+        """启用一个预设: 把它的值**合并进配置文件**并落盘.
+
+        Raises:
+            KeyError: 没有这个预设.
         """
         file_data = self.raw()
-        chosen = preset or file_data.get("preset") or "default"
-        merged = file_data
-        if chosen and chosen != "default":
-            overrides = self.all_presets().get(chosen)
-            if overrides is not None:
-                merged = _deep_merge(file_data, overrides)
-        merged["preset"] = chosen
-        # BaseSettings 的初始化参数会被环境变量覆盖, 这正是我们要的优先级.
-        return Settings(**merged)
+        if name == "default":
+            merged = file_data
+        else:
+            overrides = self.all_presets().get(name)
+            if overrides is None:
+                raise KeyError(name)
+            merged = _deep_merge(file_data, overrides)
+        merged["preset"] = name
+        settings = Settings(**merged)
+        self.save(settings)
+        return settings
 
     def save(self, settings: Settings) -> None:
         """把配置写回 TOML, 保留文件中已有的注释与排版."""

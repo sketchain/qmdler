@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """歌词处理.
 
 ``client.lyric.get_lyric`` 返回的 ``lyric`` / ``trans`` / ``roma`` /

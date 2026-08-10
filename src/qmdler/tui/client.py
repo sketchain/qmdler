@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """TUI 的 HTTP + WebSocket 客户端.
 
 调的是与 WebUI 完全相同的一组端点 —— TUI 里没有任何一行下载逻辑.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """任务端点: 创建、勾选、启动、暂停、恢复、取消、报告."""
 
 from __future__ import annotations

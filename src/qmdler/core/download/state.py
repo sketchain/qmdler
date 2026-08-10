@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """状态机.
 
 抽成纯函数, 不碰 I/O —— 这样状态流转可以单独做单元测试, 而不需要拉起整个引擎.

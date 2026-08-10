@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """凭证模块.
 
 与下载引擎完全解耦: 引擎只调 :meth:`AuthManager.get_valid_credential`, 不关心

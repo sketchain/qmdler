@@ -45,6 +45,9 @@ dev = [
     "respx>=0.21.1",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
+    # 只用于诊断模式解出二维码载荷、以及验证字符画真能被扫出来。
+    # 运行时代码不得依赖它（core/auth/qrpayload.py 全程惰性导入）。
+    "zxing-cpp>=2.2.0",
 ]
 
 [project.scripts]

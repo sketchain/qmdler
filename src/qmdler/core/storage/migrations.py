@@ -1,10 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """数据库 schema 与迁移."""
 
 from __future__ import annotations
 
 import aiosqlite
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _V1 = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -53,6 +54,9 @@ CREATE TABLE IF NOT EXISTS task_items (
     lyric_status       TEXT NOT NULL DEFAULT 'skipped',
     cover_status       TEXT NOT NULL DEFAULT 'skipped',
     tag_status         TEXT NOT NULL DEFAULT 'skipped',
+    -- 四层校验里有层没跑成 (如容器读不出时长). 记下来, 汇总报告要把这些歌
+    -- 从「已完成四层校验」里摘出去 —— 否则报告会给出全部通过的假象.
+    verify_incomplete  INTEGER NOT NULL DEFAULT 0,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL,
     started_at         INTEGER,
@@ -98,6 +102,28 @@ async def migrate(conn: aiosqlite.Connection) -> None:
     if row is None:
         await conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
     elif row[0] < SCHEMA_VERSION:
-        # 未来版本的增量迁移在这里按 row[0] 逐级 upgrade.
+        # `CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列, 所以老库要走 ALTER.
+        await _upgrade(conn, row[0])
         await conn.execute("UPDATE schema_meta SET version = ?", (SCHEMA_VERSION,))
     await conn.commit()
+
+
+async def _upgrade(conn: aiosqlite.Connection, from_version: int) -> None:
+    """按版本逐级升级已存在的库."""
+    if from_version < 2:
+        await _add_column_if_missing(
+            conn, "task_items", "verify_incomplete", "INTEGER NOT NULL DEFAULT 0",
+        )
+
+
+async def _add_column_if_missing(
+    conn: aiosqlite.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    """幂等加列 —— SQLite 没有 ``ADD COLUMN IF NOT EXISTS``."""
+    async with conn.execute(f"PRAGMA table_info({table})") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if column not in columns:
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

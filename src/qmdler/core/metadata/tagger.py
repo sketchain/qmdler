@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """写入音频标签.
 
 容器格式由音质档位决定 (见 ``SongFileType`` 的扩展名列), 所以四套写法都要覆盖:
@@ -37,6 +38,7 @@ from mutagen.id3 import (
     TXXX,
     USLT,
     ID3NoHeaderError,
+    ID3v1SaveOptions,
 )
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4, MP4Cover
@@ -161,6 +163,9 @@ def _write_flac(path: Path, payload: TagPayload, config: TagConfig) -> None:
 
 def _write_ogg(path: Path, payload: TagPayload, config: TagConfig) -> None:
     audio = OggVorbis(str(path))
+    # 与 FLAC / MP4 一致: 先清掉服务端自带的注释, 否则 QQ 写的字段会和我们的
+    # 混在一起 (只有同名 key 会被覆盖, 其余留存).
+    audio.delete()
     for key, values in _vorbis_common(payload, config).items():
         audio[key] = values
     if config.cover and payload.cover:
@@ -180,7 +185,16 @@ def _write_mp3(path: Path, payload: TagPayload, config: TagConfig) -> None:
         audio.add_tags()
     tags = audio.tags
     assert tags is not None
-    tags.delete()
+    # ⚠️ 这里必须是 clear() 而不是 delete().
+    #
+    # ``MP3.tags`` 是个 ``ID3`` 对象, 但 mutagen 不会把文件名传给它 ——
+    # ``audio.tags.filename`` 恒为 ``None``. 于是 ``tags.delete()`` (它默认拿
+    # ``self.filename`` 当参数) 直接抛 ``TypeError: Missing filename or fileobj
+    # argument``, **每一首 MP3 的 tag 都写不进去**.
+    #
+    # ``clear()`` 只清内存里的帧, 由后面的 ``audio.save()`` 统一落盘 ——
+    # 而 ``FileType.save()`` 是有 ``self.filename`` 的.
+    tags.clear()
 
     if config.title and payload.entry.title:
         tags.add(TIT2(encoding=3, text=payload.entry.title))
@@ -214,8 +228,9 @@ def _write_mp3(path: Path, payload: TagPayload, config: TagConfig) -> None:
             tags.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_GAIN", text=f"{gain[0]:.2f} dB"))
             tags.add(TXXX(encoding=3, desc="REPLAYGAIN_TRACK_PEAK", text=f"{gain[1]:.6f}"))
 
-    # ID3v2.4
-    audio.save(v2_version=4)
+    # ID3v2.4, 并去掉 QQ 原带的 ID3v1 —— 留着会和 v2.4 里的内容打架,
+    # 部分播放器优先读 v1, 显示的就是没清干净的旧值.
+    audio.save(v2_version=4, v1=ID3v1SaveOptions.REMOVE)
 
 
 def _write_mp4(path: Path, payload: TagPayload, config: TagConfig) -> None:

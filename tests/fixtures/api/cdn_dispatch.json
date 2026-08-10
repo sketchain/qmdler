@@ -1,0 +1,66 @@
+{
+  "cache_time": 86400,
+  "expiration": 86400,
+  "refresh_time": 1800,
+  "retcode": 0,
+  "sip": [
+    "http://aqqmusic.tc.qq.com/",
+    "http://sjy6.stream.qqmusic.qq.com/",
+    "http://ws6.stream.qqmusic.qq.com/",
+    "http://ws.stream.qqmusic.qq.com/",
+    "http://aqqmusic.tc.qq.com/",
+    "https://aqqmusic.tc.qq.com/",
+    "https://sjy6.stream.qqmusic.qq.com/"
+  ],
+  "sipinfo": [
+    {
+      "cdn": "http://aqqmusic.tc.qq.com/",
+      "encrypt_quic": 0,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": "aqqmusic.tc.qq.com"
+    },
+    {
+      "cdn": "http://sjy6.stream.qqmusic.qq.com/",
+      "encrypt_quic": 1,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": ""
+    },
+    {
+      "cdn": "http://ws6.stream.qqmusic.qq.com/",
+      "encrypt_quic": 0,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": "ws6.stream.qqmusic.qq.com"
+    },
+    {
+      "cdn": "http://ws.stream.qqmusic.qq.com/",
+      "encrypt_quic": 0,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": ""
+    },
+    {
+      "cdn": "https://aqqmusic.tc.qq.com/",
+      "encrypt_quic": 0,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": "aqqmusic.tc.qq.com"
+    },
+    {
+      "cdn": "https://sjy6.stream.qqmusic.qq.com/",
+      "encrypt_quic": 1,
+      "ipstack": 3,
+      "plaintext_quic": 0,
+      "quic": 0,
+      "quichost": ""
+    }
+  ],
+  "test_file": "<redacted:test_file>"
+}

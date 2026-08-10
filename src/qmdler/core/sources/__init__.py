@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """歌单来源子系统."""
 
 from .resolver import ResolvedSource, parse_mid_list, resolve

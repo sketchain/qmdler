@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """文件名清洗."""
 
 from __future__ import annotations

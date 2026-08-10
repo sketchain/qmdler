@@ -1,0 +1,201 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""归档离线校验.
+
+外部命令 (``ffprobe`` / ``ffmpeg`` / ``flac``) 缺席时必须**跳过并说明**,
+而不是报错或者假装通过 —— 这条比校验本身还重要, 因为它们不是运行时依赖.
+"""
+
+from __future__ import annotations
+
+import shutil
+from pathlib import Path
+
+import pytest
+
+from qmdler.core import archive_verify
+
+AUDIO = Path(__file__).resolve().parents[1] / "data" / "audio"
+
+_HAVE_FFPROBE = shutil.which("ffprobe") is not None
+_HAVE_FLAC = shutil.which("flac") is not None
+
+
+def test_part_file_is_failed(tmp_path: Path) -> None:
+    """``.part`` 是没下完的残片, 不是成品."""
+    path = tmp_path / "song.flac.part"
+    path.write_bytes(b"\x00" * 16)
+    verdict = archive_verify.verify_file(path)
+    assert verdict.status == "failed"
+    assert verdict.checks[0][0] == "残片"
+
+
+def test_nac_is_skipped_not_failed(tmp_path: Path) -> None:
+    """``.nac`` 无从校验, 记 skipped —— 判 failed 会让用户以为文件坏了."""
+    path = tmp_path / "song.nac"
+    path.write_bytes(b"\x00" * 16)
+    verdict = archive_verify.verify_file(path)
+    assert verdict.status == "skipped"
+    assert "腾讯自研" in verdict.checks[0][2]
+
+
+def test_broken_container_is_failed(tmp_path: Path) -> None:
+    """后缀像音频、内容是垃圾 —— 必须判 failed."""
+    path = tmp_path / "song.flac"
+    path.write_bytes(b"not a flac at all" * 8)
+    verdict = archive_verify.verify_file(path)
+    assert verdict.status == "failed"
+
+
+def test_real_file_passes(tmp_path: Path) -> None:
+    """真文件至少要过 mutagen 那一关 (无外部依赖)."""
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["mutagen 时长"] == "ok"
+    assert verdict.status != "failed"
+
+
+def test_missing_external_tools_are_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """三个外部命令都没装时, 对应检查记 skipped, 整体仍算通过."""
+    monkeypatch.setattr(archive_verify, "have", lambda _command: False)
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+
+    verdict = archive_verify.verify_file(path)
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffprobe 解析"] == "skipped"
+    assert states["ffmpeg 音频解码"] == "skipped"
+    assert states["FLAC MD5 签名"] == "skipped"
+    assert verdict.status == "ok", "缺工具不等于文件有问题"
+
+
+@pytest.mark.skipif(not _HAVE_FFPROBE, reason="没装 ffprobe")
+def test_ffprobe_reads_stream_info(tmp_path: Path) -> None:
+    """装了 ffprobe 就要读出编码与采样率."""
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+    assert verdict.codec == "flac"
+    assert verdict.sample_rate == 44100
+    assert verdict.channels == 2
+
+
+@pytest.mark.skipif(not _HAVE_FLAC, reason="没装 flac")
+def test_flac_md5_signature_is_the_criterion(tmp_path: Path) -> None:
+    """判据是 PCM 的 MD5 对不对得上 STREAMINFO 签名."""
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["FLAC MD5 签名"] == "ok"
+
+
+def test_iter_skips_unrelated_files(tmp_path: Path) -> None:
+    """只挑音频、``.nac`` 与 ``.part``, 其余不看."""
+    (tmp_path / "cover.jpg").write_bytes(b"x")
+    (tmp_path / "歌词.lrc").write_text("[00:00.00]x", encoding="utf-8")
+    (tmp_path / "a.flac").write_bytes(b"x")
+    (tmp_path / "b.nac").write_bytes(b"x")
+    (tmp_path / "c.mp3.part").write_bytes(b"x")
+
+    names = {path.name for path in archive_verify.iter_audio_files(tmp_path)}
+    assert names == {"a.flac", "b.nac", "c.mp3.part"}
+
+
+def test_verify_tree_is_recursive(tmp_path: Path) -> None:
+    """子目录也要扫到."""
+    nested = tmp_path / "歌单" / "专辑"
+    nested.mkdir(parents=True)
+    shutil.copy(AUDIO / "silence.flac", nested / "song.flac")
+    verdicts = archive_verify.verify_tree(tmp_path)
+    assert len(verdicts) == 1
+    assert verdicts[0].path.name == "song.flac"
+
+
+def test_cover_complaints_are_not_audio_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """内嵌封面的抱怨不能算音频损坏.
+
+    QQ 的封面 JPEG 自带一个损坏的 EXIF TIFF 头（从 CDN 下下来的原图就报，
+    与嵌入无关）。实测 20 首里有 4 首会因为这个被误判成音频解码失败 ——
+    既是误报，又会把真正的音频问题淹掉。
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        calls.append(args)
+        if args[0] == "ffmpeg":
+            return 0, "", "[mjpeg @ 0x55f7a53ed340] mjpeg: invalid TIFF header in EXIF data\n"
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "ok"
+    assert states["内嵌封面"] == "note"
+    assert verdict.status != "failed", "一张图的 EXIF 不能把整个文件判成损坏"
+
+
+def test_real_audio_errors_still_fail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """真正的音频解码错误不能被封面豁免顺手放过."""
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[0] == "ffmpeg":
+            return 1, "", (
+                "[mjpeg @ 0x1] mjpeg: invalid TIFF header in EXIF data\n"
+                "[flac @ 0x2] Frame CRC mismatch\n"
+            )
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    path = tmp_path / "silence.flac"
+    shutil.copy(AUDIO / "silence.flac", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "failed"
+    details = {name: detail for name, _state, detail in verdict.checks}
+    assert "CRC" in details["ffmpeg 音频解码"]
+    assert verdict.status == "failed"
+
+
+def test_missing_codec_is_skipped_not_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本机 ffmpeg 不会解这个编码 ≠ 文件坏了.
+
+    实测：`ATMOS_DB`（杜比全景声）是 .mp4 容器里的 AC-4，ffmpeg 6.1 没有
+    AC-4 解码器。判 failed 等于告诉用户「你的杜比全景声文件坏了」，
+    而 ffprobe 读得出流信息、字节数与 `size_dolby` 精确相等。
+    """
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[0] == "ffmpeg":
+            return 1, "", (
+                "[aist#0:1/ac4 @ 0x1] Decoding requested, but no decoder found for: ac4\n"
+                "[aost#0:1/pcm_s16le @ 0x2] Error initializing a simple filtergraph\n"
+                "Error opening output file -.\n"
+            )
+        return 0, "{}", ""
+
+    monkeypatch.setattr(archive_verify, "_run", fake_run)
+    monkeypatch.setattr(archive_verify, "have", lambda command: command == "ffmpeg")
+
+    # 用真文件：mutagen 那一层要能过，才测得到解码这一层。
+    path = tmp_path / "song.m4a"
+    shutil.copy(AUDIO / "silence.m4a", path)
+    verdict = archive_verify.verify_file(path)
+
+    states = {name: state for name, state, _ in verdict.checks}
+    assert states["ffmpeg 音频解码"] == "skipped"
+    # 后面那几行 filtergraph / output file 都是缺解码器的后果，不能各判一次 failed。
+    assert verdict.status != "failed"

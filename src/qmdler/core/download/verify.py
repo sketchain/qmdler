@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """试听片段与静默降级检测.
 
 ``result == 0`` 且 ``purl`` 非空, **不代表**拿到的是完整源文件. 服务端可能返回
@@ -9,8 +10,8 @@
 
 下载前 (看 URL 就能判断)
     1. 比对 ``purl`` 里 filename 的四字符前缀与请求档位的编码;
-    2. 对照 ``file.size_try`` / ``try_begin`` / ``try_end`` (以及 ``vi[4]`` /
-       ``vi[5]``) 交叉验证.
+    2. 与 ``file.size_try`` 做**绝对值**比对 —— 该值是试听片段的大小基准,
+       不是本曲正片的特征值, 详见 :func:`check_trial_size`.
 
 下载中/后 (看文件本身)
     3. Content-Length / 实际字节数 vs ``file.size_*``;
@@ -40,6 +41,41 @@ class Verdict(str, Enum):
     OK = "ok"
     TRIAL = "trial"
     DEGRADED = "degraded"
+
+
+#: 诊断输出专用的两个「这层没跑」状态. **它们不是 Verdict** —— 校验逻辑上
+#: 「没跑」等同于放行 (不能凭空判 trial), 但报告给人看时必须和「跑了且通过」
+#: 区分开.
+#:
+#: * ``skipped``: 数据本身就没有, 这层无从执行 (如 ``size_try == 0``);
+#: * ``unverified``: 数据本该有却拿不到 (如容器读不出时长).
+#:
+#: 差别在于要不要担心: ``skipped`` 是正常的, ``unverified`` 意味着这首歌的
+#: 试听检测确实少了一层, 汇总报告要单独点出来.
+LAYER_SKIPPED = "skipped"
+LAYER_UNVERIFIED = "unverified"
+
+
+def prefix_applicable(requested_quality: str, purl: str, filename: str = "") -> bool:
+    """第 1 层能不能跑: 请求档位有编码, 且从 purl/filename 里抠得出前缀."""
+    if not quality_start_code(requested_quality):
+        return False
+    return bool(extract_prefix(purl) or extract_prefix(filename))
+
+
+def trial_size_applicable(entry: SongEntry, content_length: int) -> bool:
+    """第 2 层能不能跑: 有 ``size_try`` 基准, 也探到了大小."""
+    return entry.size_try > 0 and content_length > 0
+
+
+def size_applicable(expected_size: int, actual_size: int) -> bool:
+    """第 3 层能不能跑: 期望大小与实际大小都拿到了."""
+    return expected_size > 0 and actual_size > 0
+
+
+def duration_applicable(entry: SongEntry, actual_seconds: float) -> bool:
+    """第 4 层能不能跑: 有 ``interval`` 基准, 也读出了时长."""
+    return entry.interval > 0 and actual_seconds > 0
 
 
 @dataclass(slots=True)
@@ -102,16 +138,34 @@ def check_prefix(requested_quality: str, purl: str, filename: str = "") -> Verif
 
 
 def check_trial_size(entry: SongEntry, content_length: int, *, tolerance: float = 0.02) -> VerifyResult:
-    """第 2 层: 与 ``size_try`` 交叉验证.
+    """第 2 层: 拿 ``size_try`` 当**试听片段的绝对大小基准**比对.
 
-    拿到的字节数正好等于试听片段大小, 基本可以坐实是试听.
+    ⚠️ ``size_try`` **不是本曲正片的特征值, 也不是常量**. 实测 12 首歌它只取到
+    三个值: ``960887`` (8 首)、``481070`` (1 首)、``0`` (3 首, 即该曲没有这项).
+    它是「试听片段有多大」的基准 —— ``960887 ≈ 128kbps × 60s``,
+    ``481070`` 差不多是它的一半 (30s), 上一轮实测 ``SpecialSongFileType.TRY``
+    (``RS02``) 片段的 Content-Length 正好等于 ``960887``.
+
+    所以拿它跟**正片**大小做「交叉验证」没有意义 (量纲都不对);
+    正确用法是**绝对值比对**: 探到/落盘的大小落在 ``size_try`` 的 ±tolerance 内
+    直接判 trial —— 与 ``interval`` 无关、与档位无关, 是极强的信号.
+
+    两条实现约束:
+
+    * 始终读 ``entry.size_try``, **不要硬编码 960887**. 它至少有两个取值,
+      高码率试听 (如 ``O802``) 也未必相同, 写死就会漏判;
+    * ``size_try == 0`` 时本层直接放行 —— 没有基准可比, 不能瞎判.
     """
     if entry.size_try <= 0 or content_length <= 0:
         return OK
     delta = abs(content_length - entry.size_try) / entry.size_try
     if delta <= tolerance:
-        begin, end = entry.trial_window_ms
-        window = f"，试听区间 {begin}~{end}ms" if end > begin else ""
+        windows = entry.trial_windows
+        window = (
+            "，试听区间 " + "、".join(f"{begin}~{end}ms（{source}）" for begin, end, source in windows)
+            if windows
+            else ""
+        )
         return VerifyResult(
             Verdict.TRIAL,
             TrialReason.SIZE_TRY_MATCH.value,
@@ -148,24 +202,53 @@ def check_size(expected_size: int, actual_size: int, *, tolerance: float = 0.02)
 def check_duration(entry: SongEntry, actual_seconds: float, *, tolerance: float = 0.9) -> VerifyResult:
     """第 4 层: 实际时长 vs ``track.interval``.
 
-    比 ``interval`` 短一大截 (尤其落在 ``try_end - try_begin`` 附近) 即为试听片段.
+    比 ``interval`` 短一大截即为试听片段.
+
+    与试听窗口比对时**逐个比对全部已知窗口** (``file.try_begin/try_end`` 与
+    ``vi[4]/vi[5]`` 是并列候选, 不是主备), 命中任意一个都要点出来 —— 只比对
+    被选中的那一个会漏判.
     """
     expected = entry.interval
     if expected <= 0 or actual_seconds <= 0:
         return OK
+
+    # 只要与任意一个试听窗口的时长吻合, 就算 interval 比对还没到阈值也判 trial:
+    # 漏判 trial 的代价远高于误判.
+    matched = _matching_trial_window(entry, actual_seconds)
+    if matched is not None:
+        begin, end, source = matched
+        return VerifyResult(
+            Verdict.TRIAL,
+            TrialReason.DURATION_SHORT.value,
+            f"实际时长 {actual_seconds:.0f}s 与试听窗口 {begin}~{end}ms"
+            f"（{(end - begin) / 1000:.0f}s，取自 {source}）吻合，应为 {expected}s",
+        )
+
     if actual_seconds >= expected * tolerance:
         return OK
 
-    begin, end = entry.trial_window_ms
-    trial_seconds = (end - begin) / 1000 if end > begin else 0
-    hint = ""
-    if trial_seconds > 0 and abs(actual_seconds - trial_seconds) <= max(3.0, trial_seconds * 0.1):
-        hint = f"，且与试听时长 {trial_seconds:.0f}s 吻合"
     return VerifyResult(
         Verdict.TRIAL,
         TrialReason.DURATION_SHORT.value,
-        f"实际时长 {actual_seconds:.0f}s，应为 {expected}s{hint}",
+        f"实际时长 {actual_seconds:.0f}s，应为 {expected}s",
     )
+
+
+def _matching_trial_window(entry: SongEntry, actual_seconds: float) -> tuple[int, int, str] | None:
+    """实际时长命中了哪个试听窗口 (逐个比对, 不只看被选中的那个)."""
+    if actual_seconds <= 0:
+        return None
+    # 完整曲目的时长本身就短于任何窗口时不作数.
+    for begin, end, source in entry.trial_windows:
+        trial_seconds = (end - begin) / 1000
+        if trial_seconds <= 0:
+            continue
+        if entry.interval > 0 and trial_seconds >= entry.interval * 0.95:
+            # 「试听窗口」几乎等于整首歌, 比对没有意义.
+            continue
+        if abs(actual_seconds - trial_seconds) <= max(3.0, trial_seconds * 0.1):
+            return begin, end, source
+    return None
 
 
 def combine(*results: VerifyResult) -> VerifyResult:

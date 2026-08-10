@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """封面下载.
 
 尺寸是**固定六档** (``CoverSize = Literal[150, 300, 500, 800, 1200, 1500]``),
@@ -12,6 +13,7 @@ UI 里做成下拉选择, 不让用户填任意数字.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import httpx
@@ -53,9 +55,21 @@ def candidate_sizes(preferred: int) -> list[int]:
 class CoverFetcher:
     """按尺寸取封面, 404 自动降档."""
 
-    def __init__(self, http: httpx.AsyncClient) -> None:
-        """初始化."""
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        delay: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """初始化.
+
+        Args:
+            http: 复用的 HTTP 客户端.
+            delay: 降档重试之间的轻量限速. 不传就不等 —— 但生产路径必须传:
+                一张封面最多要试 6 个尺寸, 全 404 时就是 6 次背靠背请求,
+                一首歌一次、二十首歌就是一百多次.
+        """
         self._http = http
+        self._delay = delay
         #: 同一张专辑封面在整张专辑内复用, 避免重复下载.
         self._cache: dict[tuple[str, int], CoverResult] = {}
 
@@ -71,11 +85,14 @@ class CoverFetcher:
         if cached is not None:
             return cached
 
-        for size in candidate_sizes(preferred_size):
+        for index, size in enumerate(candidate_sizes(preferred_size)):
             url = entry.cover_url(size)
             if not url:
                 # 专辑与歌手都没有 mid, 再降档也没用.
                 break
+            # 首选尺寸不等; 降档重试之间要等 —— 见 __init__ 的说明.
+            if index and self._delay is not None:
+                await self._delay()
             try:
                 response = await self._http.get(url)
             except httpx.HTTPError as exc:

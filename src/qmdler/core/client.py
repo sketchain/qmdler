@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """全局唯一 ``Client`` 实例的持有者.
 
 整个应用生命周期内只维持**一个** ``Client``: 它内部是一个带令牌桶限速的

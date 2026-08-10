@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """音质选择.
 
 分层判断, 一层都不能省:

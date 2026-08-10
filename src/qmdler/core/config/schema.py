@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置模型.
 
 全部配置持久化为 TOML (路径遵循 XDG), 并支持环境变量覆盖, 前缀 ``QMDLER_``,
@@ -13,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from ..models import DEFAULT_QUALITY_CHAIN, QUALITY_TABLE
 
@@ -224,6 +225,27 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """让**环境变量压过初始化参数**.
+
+        pydantic-settings 的默认顺序是 ``init → env → dotenv → secrets``,
+        **靠前的赢** —— 也就是说默认情况下 ``Settings(**file_data)`` 里的文件值
+        会盖住环境变量, 与我们文档里承诺的「文件 < 环境变量」正好相反.
+
+        这一条是实测发现的: ``QMDLER_DOWNLOAD__INTERVAL_SECONDS=99`` 配上
+        文件里的 ``interval_seconds = 7``, 拿到的是 7. 容器部署时靠环境变量
+        覆盖文件的用法因此完全不生效.
+        """
+        return (env_settings, dotenv_settings, init_settings, file_secret_settings)
 
     preset: str = "default"
     paths: PathsConfig = Field(default_factory=PathsConfig)

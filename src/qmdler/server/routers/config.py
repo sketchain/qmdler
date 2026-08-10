@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置、模板预览、音质表、路径校验."""
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from ...core.models import (
     DEFAULT_QUALITY_CHAIN,
     QUALITY_TABLE,
     SongEntry,
+    quality_caveat,
     quality_extension,
     quality_label,
 )
@@ -24,6 +26,7 @@ from ...core.naming.template import (
     RenderContext,
     TemplateRenderer,
 )
+from ...core.sources.service import DEFAULT_LIMIT
 from ..deps import Ctx
 
 router = APIRouter(prefix="/config", tags=["config"])
@@ -90,8 +93,16 @@ _SAMPLE_SONG: dict[str, Any] = {
 
 @router.get("")
 async def get_config(context: Ctx) -> dict[str, Any]:
-    """当前生效的配置."""
-    return context.settings.as_dict()
+    """当前生效的配置.
+
+    附带 ``limits``: 拉取上限的默认值与最大值。两个前端都从这里读，
+    **不各自写死一个数** —— 之前 WebUI 写 2000/10000、TUI 写 2000、
+    后端是 2000，改一处就会漏两处。
+    """
+    return {
+        **context.settings.as_dict(),
+        "limits": {"fetch_default": DEFAULT_LIMIT, "fetch_max": DEFAULT_LIMIT},
+    }
 
 
 @router.patch("")
@@ -117,9 +128,9 @@ async def activate_preset(payload: PresetRequest, context: Ctx) -> dict[str, Any
     presets = context.config_store.all_presets()
     if payload.name != "default" and payload.name not in presets:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"预设不存在: {payload.name}")
-    context.config_store.update({"preset": payload.name})
-    settings = context.config_store.load(payload.name)
-    context.config_store.save(settings)
+    # 一次性把预设的值写进配置文件（见 ConfigStore 的模块 docstring）：
+    # 之后用户在设置界面改动这些字段能真正生效，不会重启后被预设盖回去。
+    settings = context.config_store.activate_preset(payload.name)
     await context.reload_settings(settings)
     return settings.as_dict()
 
@@ -146,6 +157,7 @@ async def qualities() -> dict[str, Any]:
                 "code": code,
                 "label": label,
                 "extension": quality_extension(code),
+                "caveat": quality_caveat(code),
             }
             for code, (label, _) in QUALITY_TABLE.items()
         ],
