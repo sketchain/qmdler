@@ -22,6 +22,29 @@ export const SettingsView = {
       saving: false,
     });
 
+    // 文本框必须绑本地草稿，不能直接绑 store.settings。
+    //
+    // 每次 patch() 成功都会把 store.settings 整个换掉，触发重渲染；而 Vue 给 input
+    // 打 value 时是拿绑定值跟 **DOM 当前值** 比对（不是跟旧 prop 比），所以只要
+    // 重渲染发生在用户正在输入的那个框上，就会把已经敲进去的字改写回服务端的旧值。
+    // 值被改回原样后浏览器认为「没变过」，change 事件不再触发，于是这一次修改
+    // 既没提示也没保存，凭空消失。
+    //
+    // 实测（连续改「目录模板 → 文件名模板 → 多歌手连接符」三个框）：
+    //   7310 f1 input "{曲序}-{歌名}({songmid})"   ← 输入进去了
+    //   7314 f1 blur  "{歌名} - {歌手}"            ← 4ms 后被弹回，没有 change
+    // 三次修改只发出两个 PATCH，中间那个字段静默丢失。
+    // v-model 绑 store 也是一样的结果 —— 症结在「重渲染改写 DOM」，不在绑定方式。
+    const draft = reactive({ dir_template: '', file_template: '', singer_separator: '', save_root: '' });
+
+    function syncDraft() {
+      if (!store.settings) return;
+      draft.dir_template = store.settings.naming.dir_template;
+      draft.file_template = store.settings.naming.file_template;
+      draft.singer_separator = store.settings.naming.singer_separator;
+      draft.save_root = store.settings.paths.save_root;
+    }
+
     const config = computed(() => store.settings);
 
     async function loadMeta() {
@@ -66,11 +89,11 @@ export const SettingsView = {
       if (!store.settings) return;
       try {
         state.preview = await api.previewTemplate({
-          dir_template: store.settings.naming.dir_template,
-          file_template: store.settings.naming.file_template,
-          singer_separator: store.settings.naming.singer_separator,
+          dir_template: draft.dir_template,
+          file_template: draft.file_template,
+          singer_separator: draft.singer_separator,
           quality: state.chain[0] || 'FLAC',
-          root: store.settings.paths.save_root,
+          root: draft.save_root,
           song: store.sourceItems.length ? store.sourceItems[0] : null,
           playlist_name: store.sourceResult ? store.sourceResult.name : '示例歌单',
         });
@@ -81,12 +104,12 @@ export const SettingsView = {
 
     async function checkPath(create = false) {
       if (!store.settings) return;
-      state.pathCheck = await api.checkPath(store.settings.paths.save_root, create);
+      state.pathCheck = await api.checkPath(draft.save_root, create);
     }
 
     function applyCombo(combo) {
-      store.settings.naming.dir_template = combo.dir;
-      store.settings.naming.file_template = combo.file;
+      draft.dir_template = combo.dir;
+      draft.file_template = combo.file;
       patch('naming', { dir_template: combo.dir, file_template: combo.file });
       refreshPreview();
     }
@@ -95,39 +118,63 @@ export const SettingsView = {
       store.settings = await api.activatePreset(name);
       state.activePreset = name;
       state.chain = [...store.settings.quality.chain];
+      syncDraft();
       toast(`已切换到预设「${name}」`);
       refreshPreview();
     }
 
-    async function savePreset() {
-      if (!state.newPresetName.trim()) return;
-      await api.savePreset(state.newPresetName.trim(), {
-        quality: store.settings.quality,
-        download: store.settings.download,
-        naming: store.settings.naming,
-        lyric: store.settings.lyric,
-        cover: store.settings.cover,
-      });
-      const presets = await api.presets();
-      state.presets = presets.presets;
-      toast('预设已保存');
+    async function removePreset(name) {
+      if (!window.confirm(`删除预设「${name}」？当前生效的配置不受影响。`)) return;
+      try {
+        await api.deletePreset(name);
+        const presets = await api.presets();
+        state.presets = presets.presets;
+        toast(`预设「${name}」已删除`);
+      } catch (error) {
+        toast(error.message, 'error');
+      }
     }
 
+    async function savePreset() {
+      const name = state.newPresetName.trim();
+      if (!name) return;
+      // 后端会挡掉带 / \ : * ? " < > | 的名字，不接住的话是一个未处理的 Promise
+      // rejection —— 预设没建成，界面上却什么都不显示。
+      try {
+        await api.savePreset(name, {
+          quality: store.settings.quality,
+          download: store.settings.download,
+          naming: store.settings.naming,
+          lyric: store.settings.lyric,
+          cover: store.settings.cover,
+        });
+      } catch (error) {
+        toast(`预设保存失败：${error.message}`, 'error');
+        return;
+      }
+      const presets = await api.presets();
+      state.presets = presets.presets;
+      state.newPresetName = '';
+      toast(`预设「${name}」已保存`);
+    }
+
+    // 看草稿而不是 store：用户每敲一个字预览就刷新，和改动前的手感一致。
     watch(
-      () => store.settings && [store.settings.naming.dir_template, store.settings.naming.file_template].join('|'),
+      () => [draft.dir_template, draft.file_template, draft.singer_separator].join('|'),
       () => refreshPreview(),
     );
 
     onMounted(async () => {
       if (!store.settings) store.settings = await api.getConfig();
       state.chain = [...store.settings.quality.chain];
+      syncDraft();
       await loadMeta();
       await refreshPreview();
     });
 
     return {
-      state, store, config, patch, saveChain, refreshPreview, checkPath,
-      applyCombo, activatePreset, savePreset, formatBytes,
+      state, store, config, draft, patch, saveChain, refreshPreview, checkPath,
+      applyCombo, activatePreset, savePreset, removePreset, formatBytes,
     };
   },
   template: `
@@ -222,18 +269,18 @@ export const SettingsView = {
       <div v-if="state.section==='naming'" class="card">
         <div class="field">
           <label>目录模板（其中的 / 就是目录层级）</label>
-          <input type="text" v-model="config.naming.dir_template"
-                 @change="patch('naming.dir_template', config.naming.dir_template)" />
+          <input type="text" v-model="draft.dir_template"
+                 @change="patch('naming.dir_template', draft.dir_template)" />
         </div>
         <div class="field">
           <label>文件名模板</label>
-          <input type="text" v-model="config.naming.file_template"
-                 @change="patch('naming.file_template', config.naming.file_template)" />
+          <input type="text" v-model="draft.file_template"
+                 @change="patch('naming.file_template', draft.file_template)" />
         </div>
         <div class="field">
           <label>多歌手连接符</label>
-          <input type="text" v-model="config.naming.singer_separator"
-                 @change="patch('naming.singer_separator', config.naming.singer_separator)" />
+          <input type="text" v-model="draft.singer_separator"
+                 @change="patch('naming.singer_separator', draft.singer_separator)" />
         </div>
 
         <strong>预设</strong>
@@ -338,7 +385,7 @@ export const SettingsView = {
       <div v-if="state.section==='storage'" class="card">
         <div class="field">
           <label>下载根目录</label>
-          <input type="text" v-model="config.paths.save_root" @change="patch('paths.save_root', config.paths.save_root)" />
+          <input type="text" v-model="draft.save_root" @change="patch('paths.save_root', draft.save_root)" />
         </div>
         <div class="row">
           <button class="btn--sm" @click="checkPath(false)">校验</button>
@@ -358,11 +405,19 @@ export const SettingsView = {
         <p class="muted">当前预设：<strong>{{ state.activePreset }}</strong></p>
         <div class="row">
           <button class="btn--sm" @click="activatePreset('default')">default</button>
-          <button v-for="(_, name) in state.presets" :key="name" class="btn--sm"
-                  :class="{'btn--primary': name===state.activePreset}" @click="activatePreset(name)">
-            {{ name }}
-          </button>
+          <!-- 以前只能建不能删：DELETE 端点一直存在，但界面上没有任何入口，
+               打错一个名字就永远留在列表里。 -->
+          <span v-for="(_, name) in state.presets" :key="name" class="row row--tight">
+            <button class="btn--sm" :class="{'btn--primary': name===state.activePreset}"
+                    @click="activatePreset(name)">{{ name }}</button>
+            <button class="btn--sm btn--danger" :title="'删除预设「' + name + '」'"
+                    @click="removePreset(name)">✕</button>
+          </span>
         </div>
+        <p class="faint">
+          切换预设会把预设里的值<strong>一次性写进配置文件</strong>；切回 default 只是改回标签，
+          不会还原之前被覆盖的设置。
+        </p>
         <div class="field" style="margin-top:12px">
           <label>把当前设置存为新预设</label>
           <input type="text" v-model="state.newPresetName" placeholder="预设名称" />

@@ -3,6 +3,26 @@
 
 const BASE = '/api';
 
+// FastAPI 的 422 里 detail 是一个数组，直接 JSON.stringify 出来的是
+// [{"type":"greater_than_equal","loc":["body","limit"],...}] 这种东西，
+// 原样弹进 toast 等于没提示。这里翻成「字段：原因」。
+function describeError(payload, response) {
+  const detail = payload && payload.detail !== undefined ? payload.detail : null;
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const lines = detail
+      .map((entry) => {
+        if (!entry || typeof entry !== 'object') return String(entry);
+        const field = Array.isArray(entry.loc) ? entry.loc.filter((x) => x !== 'body').join('.') : '';
+        return field ? `${field}：${entry.msg || '取值不合法'}` : (entry.msg || '取值不合法');
+      })
+      .filter(Boolean);
+    if (lines.length) return `请求参数不合法 —— ${lines.join('；')}`;
+  }
+  if (detail) return typeof detail === 'string' ? detail : JSON.stringify(detail);
+  return `HTTP ${response.status} ${response.statusText || ''}`.trim();
+}
+
 async function request(method, path, body) {
   const options = { method, headers: {} };
   if (body !== undefined) {
@@ -20,8 +40,7 @@ async function request(method, path, body) {
     }
   }
   if (!response.ok) {
-    const detail = payload && payload.detail ? payload.detail : response.statusText;
-    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    const error = new Error(describeError(payload, response));
     error.status = response.status;
     throw error;
   }
@@ -79,6 +98,7 @@ export const api = {
   presets: () => request('GET', '/config/presets'),
   activatePreset: (name) => request('POST', '/config/presets/activate', { name }),
   savePreset: (name, overrides) => request('POST', '/config/presets', { name, overrides }),
+  deletePreset: (name) => request('DELETE', `/config/presets/${encodeURIComponent(name)}`),
   qualities: () => request('GET', '/config/qualities'),
   templates: () => request('GET', '/config/templates'),
   previewTemplate: (payload) => request('POST', '/config/templates/preview', payload),

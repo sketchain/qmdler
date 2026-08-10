@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from ...core.config.schema import NamingConfig, Settings
 from ...core.fsutil import check_path, list_directories
@@ -26,7 +26,6 @@ from ...core.naming.template import (
     RenderContext,
     TemplateRenderer,
 )
-from ...core.sources.service import DEFAULT_LIMIT
 from ..deps import Ctx
 
 router = APIRouter(prefix="/config", tags=["config"])
@@ -39,10 +38,29 @@ class ConfigPatch(BaseModel):
 
 
 class PresetRequest(BaseModel):
-    """切换 / 保存预设."""
+    """切换 / 保存预设.
 
-    name: str
+    ``name`` 必须校验: 预设名是 TOML 的表名, 同时也进 ``DELETE /presets/{name}``
+    的路径段. 名字里带 ``/`` 时创建会成功, 删除却会被路由判成 405 (``%2F`` 也一样,
+    Starlette 在路由前就解码了) —— 结果是一个只能靠手改 presets.toml 才能清掉的
+    僵尸预设. 所以在入口就把这类名字挡掉.
+    """
+
+    name: str = Field(min_length=1, max_length=64)
     overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("预设名不能为空")
+        bad = set(name) & set('/\\:*?"<>|')
+        if bad:
+            raise ValueError(f"预设名不能包含 {''.join(sorted(bad))}")
+        if name in {".", ".."}:
+            raise ValueError("预设名不能是 . 或 ..")
+        return name
 
 
 class PreviewRequest(BaseModel):
@@ -99,10 +117,7 @@ async def get_config(context: Ctx) -> dict[str, Any]:
     **不各自写死一个数** —— 之前 WebUI 写 2000/10000、TUI 写 2000、
     后端是 2000，改一处就会漏两处。
     """
-    return {
-        **context.settings.as_dict(),
-        "limits": {"fetch_default": DEFAULT_LIMIT, "fetch_max": DEFAULT_LIMIT},
-    }
+    return context.settings_payload()
 
 
 @router.patch("")
@@ -113,7 +128,7 @@ async def patch_config(payload: ConfigPatch, context: Ctx) -> dict[str, Any]:
     except ValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, exc.json()) from exc
     await context.reload_settings(settings)
-    return settings.as_dict()
+    return context.settings_payload(settings)
 
 
 @router.get("/presets")
@@ -132,7 +147,7 @@ async def activate_preset(payload: PresetRequest, context: Ctx) -> dict[str, Any
     # 之后用户在设置界面改动这些字段能真正生效，不会重启后被预设盖回去。
     settings = context.config_store.activate_preset(payload.name)
     await context.reload_settings(settings)
-    return settings.as_dict()
+    return context.settings_payload(settings)
 
 
 @router.post("/presets")
@@ -142,9 +157,14 @@ async def save_preset(payload: PresetRequest, context: Ctx) -> dict[str, Any]:
     return {"ok": True, "presets": list(context.config_store.all_presets())}
 
 
-@router.delete("/presets/{name}")
+@router.delete("/presets/{name:path}")
 async def delete_preset(name: str, context: Ctx) -> dict[str, bool]:
-    """删除用户预设."""
+    """删除用户预设.
+
+    用 ``:path`` 而不是普通路径段: 新建时已经挡掉了带 ``/`` 的名字, 但历史
+    存下来的脏数据还在 presets.toml 里, 普通路径段会让 ``a/b`` 这种名字匹配不上路由
+    (返回 405, ``%2F`` 也一样 —— Starlette 在路由前就解码了), 结果是删不掉的僵尸预设.
+    """
     return {"ok": context.config_store.delete_preset(name)}
 
 

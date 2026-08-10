@@ -45,13 +45,33 @@ export const TasksView = {
       store.report = await api.report(store.activeTaskId);
     }
 
+    const retryableCount = computed(
+      () => store.items.filter((item) => ['failed', 'trial', 'unavailable'].includes(item.status)).length,
+    );
+
+    async function retryFailed() {
+      if (!store.activeTaskId || !retryableCount.value) return;
+      const n = retryableCount.value;
+      if (!window.confirm(`将把 ${n} 首「失败 / 试听 / 受限」的曲目重新排队下载，确定吗？`)) return;
+      try {
+        const result = await api.retryFailed(store.activeTaskId);
+        await refresh();
+        toast(`已重新排队 ${(result && result.reset) ?? n} 首`);
+      } catch (error) {
+        toast(error.message, 'error');
+      }
+    }
+
     const activeTask = computed(() => store.tasks.find((task) => task.id === store.activeTaskId) || null);
     const counts = computed(() => store.engine.counts || {});
     const csvUrl = computed(() => (store.activeTaskId ? api.reportCsvUrl(store.activeTaskId) : '#'));
 
     onMounted(refresh);
 
-    return { state, store, api, refresh, select, act, loadReport, activeTask, counts, csvUrl, formatDuration };
+    return {
+      state, store, api, refresh, select, act, loadReport, retryFailed, retryableCount,
+      activeTask, counts, csvUrl, formatDuration,
+    };
   },
   template: `
     <div>
@@ -96,7 +116,14 @@ export const TasksView = {
           <button class="btn--primary btn--sm" @click="act(api.startTask)" :disabled="!store.activeTaskId || store.engine.running">开始 / 继续</button>
           <button class="btn--sm" @click="act(api.pauseTask)" :disabled="!store.engine.running">暂停</button>
           <button class="btn--sm btn--danger" @click="act(api.cancelTask)" :disabled="!store.activeTaskId">取消</button>
-          <button class="btn--sm" @click="act(api.retryFailed).then(refresh)" :disabled="!store.activeTaskId">只重试失败项</button>
+          <!-- 后端 reset_failed 的范围是 failed + trial + unavailable（见 tasks.py 的 retry-failed）。
+               原来按钮只写「只重试失败项」，一个全是「受限」的任务点下去会把几千首整个重排队，
+               按默认 180s 间隔能跑好几天。名字和提示都得说清真实范围。 -->
+          <button class="btn--sm" @click="retryFailed"
+                  :title="'把失败 / 试听 / 受限 的条目重新排队（不含已成功与已跳过）'"
+                  :disabled="!store.activeTaskId || !retryableCount">
+            重试失败/试听/受限{{ retryableCount ? '（' + retryableCount + '）' : '' }}
+          </button>
         </div>
       </div>
 

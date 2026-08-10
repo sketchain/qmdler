@@ -71,6 +71,8 @@ class AuthManager:
         self._last_refresh: float = 0.0
         self._last_check: float = 0.0
         self._profile: dict[str, Any] = {}
+        # 持有后台任务的强引用, 否则可能在跑完前被 GC 掉.
+        self._background: set[asyncio.Task[None]] = set()
 
     # -- 生命周期 ------------------------------------------------------------ #
 
@@ -82,6 +84,9 @@ class AuthManager:
             logger.info("已加载本地凭证 musicid=%s", credential.musicid)
             with contextlib.suppress(Exception):
                 await self.verify(refresh_if_expired=True)
+            # 进程重启后 _profile 是空的, 不补这一次的话前端(和 TUI)会一直显示
+            # musicid + 「普通用户」, 直到用户手动刷新页面. WS 重连时同样会撞上.
+            self._schedule_profile_load()
         self._task = asyncio.create_task(self._refresh_loop(), name="qmdler-credential-refresh")
         self._broadcast()
 
@@ -200,7 +205,25 @@ class AuthManager:
         self._profile = {}
         self._bus.log(f"登录成功 musicid={credential.musicid}", level="info")
         self._broadcast()
+        # 上面那次广播里 profile 必然是空的, 前端只能退回显示 musicid + 「普通用户」——
+        # 一个 SVIP 刚登录完看到自己是普通用户. 以前要手动刷新页面才会正常, 因为
+        # 拉 profile 的唯一触发点是前端挂载时的那一次调用, 而登录成功时页面早就挂载完了.
+        # 这里补一次后台加载, load_profile 内部会再广播一次带 profile 的 auth_state.
+        self._schedule_profile_load()
         return credential
+
+    def _schedule_profile_load(self) -> None:
+        """后台补拉一次账号信息, 不阻塞登录返回, 失败也不影响登录本身."""
+
+        async def _load() -> None:
+            try:
+                await self.load_profile(refresh=True)
+            except Exception as exc:  # 账号信息拉不到不该让登录失败
+                logger.warning("登录后加载账号信息失败: %s", exc)
+
+        task = asyncio.create_task(_load(), name="qmdler-profile-load")
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def logout(self) -> None:
         """登出并清空本地凭证."""

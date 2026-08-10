@@ -94,6 +94,7 @@ export const TracksView = {
     });
 
     const isTaskMode = computed(() => Boolean(store.activeTaskId && store.items.length));
+    const hasSource = computed(() => isTaskMode.value || Boolean(store.sourceResult));
 
     function toggle(row) {
       if (isTaskMode.value) {
@@ -113,8 +114,11 @@ export const TracksView = {
           .catch((error) => toast(error.message, 'error'));
         return;
       }
+      // 三个按钮的作用域必须一致：都只作用于当前过滤后可见的行。
+      // 「全不选」原先是 clear() 整个集合，过滤态下会把过滤器藏起来的选择一并抹掉 ——
+      // 用户过滤出几首想取消，结果整份选择没了，而且没有任何提示。
       if (value) rows.value.forEach((row) => store.selectedMids.add(row.songmid));
-      else store.selectedMids.clear();
+      else rows.value.forEach((row) => store.selectedMids.delete(row.songmid));
     }
 
     function invert() {
@@ -200,7 +204,7 @@ export const TracksView = {
     const visibleRows = computed(() => rows.value.slice(window_.value.start, window_.value.end));
 
     return {
-      state, store, rows, isTaskMode, toggle, selectAll, invert, createTask,
+      state, store, rows, isTaskMode, hasSource, toggle, selectAll, invert, createTask,
       badgeFor, warnings, bestQuality, selectedCount, formatBytes, formatDuration,
       scroller, onScroll, isNarrow, visibleRows, window: window_,
     };
@@ -245,7 +249,12 @@ export const TracksView = {
         </button>
       </div>
 
-      <p v-if="!rows.length" class="muted">左侧选择一个来源后，曲目会显示在这里。</p>
+      <!-- 「过滤没命中」和「还没选来源」是两回事，用同一句话会让人以为来源没加载上。 -->
+      <p v-if="!rows.length && hasSource && state.keyword.trim()" class="muted">
+        没有匹配「{{ state.keyword }}」的曲目。<a href="#" @click.prevent="state.keyword=''">清空过滤</a>
+      </p>
+      <p v-else-if="!rows.length && hasSource" class="muted">这个来源没有可显示的曲目。</p>
+      <p v-else-if="!rows.length" class="muted">左侧选择一个来源后，曲目会显示在这里。</p>
 
       <!-- 只渲染当前这一种布局，并且只渲染视口内的行。 -->
       <div class="vlist" ref="scroller" @scroll.passive="onScroll" v-if="rows.length">

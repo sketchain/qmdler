@@ -11,7 +11,9 @@ export const SourcesView = {
   setup() {
     const state = reactive({
       tab: 'created',
-      input: '',
+      // 每个来源标签页各自一份输入。共用一个 input 会串台：在「链接/ID」里粘了
+      // 一条歌单链接，切到「搜索」，搜索框里就是那条链接，点下去等于拿 URL 当关键词搜。
+      inputs: { link: '', search: '', manual: '' },
       // 默认值从后端读（store.settings.limits），这里只是它到位前的占位。
       limit: 0,
       loading: false,
@@ -48,6 +50,12 @@ export const SourcesView = {
           limit: state.limit,
           name: name || '',
         });
+        // 必须先退出「任务模式」再灌新数据。曲目列表在 activeTaskId 有值时优先渲染
+        // 任务条目，不清掉的话新拉的歌单会被旧任务整个盖住 —— 表现为「点了歌单没反应」，
+        // 而且「创建下载任务」按钮也不出现，用户等于卡死在上一个任务里。
+        store.activeTaskId = '';
+        store.items = [];
+        store.report = null;
         store.sourceResult = result;
         store.sourceItems = result.items;
         store.selectedMids = new Set(result.items.map((item) => item.songmid));
@@ -61,7 +69,7 @@ export const SourcesView = {
     }
 
     async function fetchFromInput() {
-      const text = state.input.trim();
+      const text = state.inputs.link.trim();
       if (!text) return;
       try {
         const resolved = await api.resolveLink(text);
@@ -139,17 +147,18 @@ export const SourcesView = {
       <div v-if="state.tab==='link'">
         <div class="field">
           <label>歌单 / 专辑 / 歌手 分享链接或 ID</label>
-          <input type="text" v-model="state.input" placeholder="https://y.qq.com/n/ryqq/playlist/7392570702" />
+          <input type="text" v-model="state.inputs.link" placeholder="https://y.qq.com/n/ryqq/playlist/7392570702" />
         </div>
-        <button class="btn--primary" style="width:100%" @click="fetchFromInput" :disabled="state.loading">解析并拉取</button>
+        <button class="btn--primary" style="width:100%" @click="fetchFromInput"
+                :disabled="state.loading || !state.inputs.link.trim()">解析并拉取</button>
       </div>
 
       <div v-if="state.tab==='search'">
         <div class="field">
           <label>搜索关键词</label>
-          <input type="search" v-model="state.input" placeholder="歌名 / 歌手" />
+          <input type="search" v-model="state.inputs.search" placeholder="歌名 / 歌手" />
         </div>
-        <button class="btn--primary" style="width:100%" @click="fetchSource('search', state.input, '')" :disabled="state.loading || !state.input">
+        <button class="btn--primary" style="width:100%" @click="fetchSource('search', state.inputs.search, '')" :disabled="state.loading || !state.inputs.search.trim()">
           搜索
         </button>
       </div>
@@ -157,9 +166,9 @@ export const SourcesView = {
       <div v-if="state.tab==='manual'">
         <div class="field">
           <label>每行一个 songmid（也接受分享链接）</label>
-          <textarea v-model="state.input" placeholder="003w2xz20QlUZt&#10;004Z8Ihr0JIu5s"></textarea>
+          <textarea v-model="state.inputs.manual" placeholder="003w2xz20QlUZt&#10;004Z8Ihr0JIu5s"></textarea>
         </div>
-        <button class="btn--primary" style="width:100%" @click="fetchSource('manual', state.input, '手动列表')" :disabled="state.loading || !state.input">
+        <button class="btn--primary" style="width:100%" @click="fetchSource('manual', state.inputs.manual, '手动列表')" :disabled="state.loading || !state.inputs.manual.trim()">
           查询详情并载入
         </button>
         <p class="faint">这是唯一必须逐首调 query_song 的来源（其它来源的列表接口已经返回完整信息）。</p>

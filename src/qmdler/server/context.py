@@ -27,7 +27,7 @@ from ..core.events import EventBus, EventKind
 from ..core.fsutil import expand
 from ..core.metadata.service import MetadataService
 from ..core.netutil import public_bases
-from ..core.sources.service import SourceService
+from ..core.sources.service import DEFAULT_LIMIT, SourceService
 from ..core.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
@@ -56,18 +56,32 @@ class AppContext:
     engine: DownloadEngine
     _holder: ClientHolder
 
+    def settings_payload(self, settings: Settings | None = None) -> dict[str, Any]:
+        """发给前端的配置载荷: 配置本体 + ``limits``.
+
+        **凡是会写进前端 ``store.settings`` 的地方都必须走这里**, 一处漏掉就会出问题:
+        前端的拉取上限只有 ``limits.fetch_default`` 一个来源, 缺了它 ``state.limit``
+        停在 0, 点任何歌单都会撞 ``limit >= 1`` 的校验 (实测首屏必现 422).
+        快照、``GET /api/config``、``PATCH /api/config``、切换预设、``config_changed``
+        推送, 这五条路径都会覆盖 ``store.settings``, 因此必须同源.
+        """
+        return {
+            **(settings or self.settings).as_dict(),
+            "limits": {"fetch_default": DEFAULT_LIMIT, "fetch_max": DEFAULT_LIMIT},
+        }
+
     async def reload_settings(self, settings: Settings) -> None:
         """热更新配置."""
         self.settings = settings
         self.engine.apply_settings(settings)
-        self.bus.emit(EventKind.CONFIG_CHANGED, settings.as_dict())
+        self.bus.emit(EventKind.CONFIG_CHANGED, self.settings_payload(settings))
 
     def snapshot(self) -> dict[str, Any]:
         """给刚连上来的客户端一份全量快照."""
         return {
             "auth": self.auth.state(),
             "engine": self.engine.state.as_dict(),
-            "settings": self.settings.as_dict(),
+            "settings": self.settings_payload(),
         }
 
 
