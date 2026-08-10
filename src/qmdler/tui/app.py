@@ -64,6 +64,7 @@ class QmdlerApp(App[None]):
         ("r", "report", "报告"),
         ("space", "toggle_item", "勾选"),
         ("a", "select_all", "全选"),
+        ("d", "select_none", "全不选"),
         ("i", "invert", "反选"),
     ]
 
@@ -80,6 +81,10 @@ class QmdlerApp(App[None]):
         self._items: list[dict[str, Any]] = []
         self._source_items: list[dict[str, Any]] = []
         self._source_meta: dict[str, Any] = {}
+        # 建任务之前的勾选集合。没有它的话 space / a / i 三个键在「拉完来源、还没
+        # 建任务」这段时间里是静默失效的（那三个 action 都以 _task_id 为前提直接
+        # return），用户只能先把整份歌单建成任务再回头取消勾选。
+        self._selected_mids: set[str] = set()
         self._task_id = ""
         self._breakpoint = ""
         self._view = "tracks"
@@ -222,7 +227,7 @@ class QmdlerApp(App[None]):
                     "album": item.get("album_name", ""),
                     "best_quality": annotation.get("best_available_label", ""),
                     "status": "pending",
-                    "selected": True,
+                    "selected": item["songmid"] in self._selected_mids,
                     "progress": 0,
                 },
             )
@@ -443,7 +448,20 @@ class QmdlerApp(App[None]):
         """勾选/取消勾选当前行."""
         table = self.query_one("#tracks", DataTable)
         row = table.cursor_row
-        if row is None or not self._items or row >= len(self._items):
+        if row is None:
+            return
+        # 还没建任务时改本地勾选集合; 建了任务才走服务端接口.
+        if not self._task_id:
+            if not self._source_items or row >= len(self._source_items):
+                return
+            songmid = self._source_items[row]["songmid"]
+            if songmid in self._selected_mids:
+                self._selected_mids.discard(songmid)
+            else:
+                self._selected_mids.add(songmid)
+            self._fill_table()
+            return
+        if not self._items or row >= len(self._items):
             return
         item = self._items[row]
         target = not item.get("selected", True)
@@ -455,15 +473,31 @@ class QmdlerApp(App[None]):
     async def action_select_all(self) -> None:
         """全选."""
         if not self._task_id:
+            self._selected_mids = {item["songmid"] for item in self._source_items}
+            self._fill_table()
             return
         with contextlib.suppress(Exception):
             await self.api.set_selection(self._task_id, None, True)
             self._items = await self.api.list_items(self._task_id)
         self._fill_table()
 
+    async def action_select_none(self) -> None:
+        """全不选."""
+        if not self._task_id:
+            self._selected_mids.clear()
+            self._fill_table()
+            return
+        with contextlib.suppress(Exception):
+            await self.api.set_selection(self._task_id, None, False)
+            self._items = await self.api.list_items(self._task_id)
+        self._fill_table()
+
     async def action_invert(self) -> None:
         """反选."""
         if not self._task_id:
+            everything = {item["songmid"] for item in self._source_items}
+            self._selected_mids = everything - self._selected_mids
+            self._fill_table()
             return
         with contextlib.suppress(Exception):
             await self.api.invert_selection(self._task_id)
@@ -539,6 +573,7 @@ class QmdlerApp(App[None]):
         )
         self._source_items = result["items"]
         self._source_meta = result
+        self._selected_mids = {item["songmid"] for item in result["items"]}
         self._items = []
         self._task_id = ""
         self._view = "tracks"
@@ -564,18 +599,23 @@ class QmdlerApp(App[None]):
         if not self._source_items:
             self._write_log("[yellow]先拉取一个来源[/yellow]")
             return
+        if not self._selected_mids:
+            self._write_log("[yellow]一首都没勾选，先用 space / a 选几首[/yellow]")
+            return
         task = await self.api.create_task(
             {
                 "name": self._source_meta.get("name", "任务"),
                 "source_type": self._source_meta.get("source_type", "manual"),
                 "source_id": str(self._source_meta.get("identifier", "")),
                 "items": self._source_items,
+                "selected_mids": sorted(self._selected_mids),
                 "quality_chain": (self._config.get("quality") or {}).get("chain", []),
             },
         )
         self._task_id = task["id"]
         self._items = await self.api.list_items(self._task_id)
         self._source_items = []
+        self._selected_mids = set()
         self._fill_table()
         self._write_log(f"任务已创建：{task['name']}（按 G 开始）")
 
