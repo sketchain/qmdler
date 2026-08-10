@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """应用上下文.
 
 整个进程只有一个: 一个 ``Client``、一个 ``Repository``、一个 ``EventBus``、

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """附加内容 (歌词 / 封面 / tag) 子系统."""
 
 from . import lyric

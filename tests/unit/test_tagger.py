@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """标签写入 —— 用**真实音频文件**跑, 不 mock mutagen.
 
 这个模块之前一条用例都没有, 代价是 **MP3 的 tag 从来就没写进去过**:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """把真实 API 响应脱敏成可入库的快照.
 
 用法::

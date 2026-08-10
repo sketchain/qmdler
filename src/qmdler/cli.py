@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """命令行入口.
 
 * ``qmdler web``      启 WebUI

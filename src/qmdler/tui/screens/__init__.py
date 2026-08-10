@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """TUI 屏幕."""
 
 from .login import LoginScreen

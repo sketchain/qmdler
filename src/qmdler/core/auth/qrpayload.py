@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """二维码载荷解码 —— **仅诊断模式使用**.
 
 ``zxing-cpp`` 只在 dev 依赖里, 运行时代码不得依赖它: 正常登录流程用不着载荷,

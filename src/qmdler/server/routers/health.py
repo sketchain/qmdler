@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """健康检查与快照."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置读写与预设管理.
 
 优先级 (低 → 高): **内置默认 → TOML 文件 → 环境变量**.

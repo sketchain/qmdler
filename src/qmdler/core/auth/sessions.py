@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """五种登录方式.
 
 1. QQ 扫码 (``QRLoginType.QQ``)

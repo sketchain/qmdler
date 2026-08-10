@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """归档离线校验.
 
 外部命令 (``ffprobe`` / ``ffmpeg`` / ``flac``) 缺席时必须**跳过并说明**,

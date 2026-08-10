@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """网络地址工具.
 
 打印二维码图片地址时要给出**手机真能打开**的 URL: 绑在 ``0.0.0.0`` 或

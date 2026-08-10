@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载引擎端到端流程 (全 mock, 不触网).
 
 重点验证几条硬约束:

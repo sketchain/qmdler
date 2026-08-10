@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """CDN 池.
 
 ``purl`` 是**相对路径**, 必须先 ``client.song.get_cdn_dispatch()`` 拿到 ``sip``

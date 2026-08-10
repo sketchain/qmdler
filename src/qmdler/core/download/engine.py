@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """下载引擎.
 
 硬约束 (实现过程中不为便利妥协):

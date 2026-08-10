@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """登录相关端点. 五种方式并列."""
 
 from __future__ import annotations

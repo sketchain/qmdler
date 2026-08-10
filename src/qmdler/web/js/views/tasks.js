@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 任务面板：进度、倒计时、暂停/恢复/取消、汇总报告。
 
 import { api } from '../api.js';

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """试听 / 静默降级检测 —— 本项目最危险的静默错误."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """日志配置: 控制台 (Rich) + 可选文件轮转."""
 
 from __future__ import annotations

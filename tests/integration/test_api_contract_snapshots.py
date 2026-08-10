@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """真实响应快照的契约测试.
 
 ``tests/fixtures/api/`` 现在是空的 —— 见那边的 README: 与其塞几个自己编的 JSON

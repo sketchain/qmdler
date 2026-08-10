@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """终端二维码还原与两道自检.
 
 素材是从上游真实接口取回的登录二维码 (见 ``tests/data/qr/README.md``) ——

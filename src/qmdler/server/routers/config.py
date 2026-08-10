@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置、模板预览、音质表、路径校验."""
 
 from __future__ import annotations

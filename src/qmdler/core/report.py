@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """汇总报告与 CSV 导出."""
 
 from __future__ import annotations

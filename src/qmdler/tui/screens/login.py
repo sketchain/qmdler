@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """登录界面: 五种方式."""
 
 from __future__ import annotations

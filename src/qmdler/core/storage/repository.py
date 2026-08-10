@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """SQLite 仓储层.
 
 引擎与服务层只跟这里打交道, 不直接写 SQL.

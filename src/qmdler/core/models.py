@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """领域模型.
 
 这里定义的是 qmdler 自己的内部模型, 与 ``qqmusic_api`` 的响应模型解耦:

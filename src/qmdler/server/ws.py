@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """WebSocket 广播.
 
 任务状态、进度、日志都通过这里推给两个前端. 同时开着 WebUI 和 TUI 时, 任一端的

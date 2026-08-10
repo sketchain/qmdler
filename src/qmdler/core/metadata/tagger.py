@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """写入音频标签.
 
 容器格式由音质档位决定 (见 ``SongFileType`` 的扩展名列), 所以四套写法都要覆盖:

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """歌单来源端点."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """把二维码图片转成终端字符画.
 
 规范里写的是「TUI 用 ``qrcode`` 库渲染终端字符二维码」, 但 ``qrcode`` 只能**编码**,

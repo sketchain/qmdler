@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """配置模型.
 
 全部配置持久化为 TOML (路径遵循 XDG), 并支持环境变量覆盖, 前缀 ``QMDLER_``,

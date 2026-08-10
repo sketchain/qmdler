@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """REST 接口契约.
 
 WebUI 和 TUI 都靠这组端点, 形状不能随便改.

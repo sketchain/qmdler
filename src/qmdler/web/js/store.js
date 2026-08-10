@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 全局状态。不引入 Pinia，reactive() 足够。
 
 const { reactive } = Vue;

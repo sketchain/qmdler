@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """数据库 schema 与迁移."""
 
 from __future__ import annotations

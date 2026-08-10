@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """FastAPI 应用."""
 
 from __future__ import annotations

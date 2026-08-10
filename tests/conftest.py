@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """测试夹具."""
 
 from __future__ import annotations

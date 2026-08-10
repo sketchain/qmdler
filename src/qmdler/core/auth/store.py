@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """凭证持久化.
 
 务必整体序列化 ``Credential`` 的全部字段, 而不是只存 musicid / musickey /

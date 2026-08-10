@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """「声称具备」的行为逐条钉住.
 
 这个文件的由来: 项目里连着出了三次同一类问题 —— **规范或 docstring 里写了,

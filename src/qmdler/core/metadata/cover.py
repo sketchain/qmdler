@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """封面下载.
 
 尺寸是**固定六档** (``CoverSize = Literal[150, 300, 500, 800, 1200, 1500]``),

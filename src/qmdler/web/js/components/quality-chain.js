@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 音质优先级链：拖拽排序生成，不是单选。
 //
 // HTML5 drag-and-drop 在移动浏览器上基本不可用，所以用 vendored 的 SortableJS

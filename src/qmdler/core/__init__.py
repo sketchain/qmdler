@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """qmdler 核心.
 
 下载引擎、任务调度、元数据处理、文件名生成、持久化都在这里.

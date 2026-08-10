@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """试听片段与静默降级检测.
 
 ``result == 0`` 且 ``purl`` 非空, **不代表**拿到的是完整源文件. 服务端可能返回

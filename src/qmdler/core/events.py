@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """进程内事件总线.
 
 下载引擎 / 凭证模块只管 ``publish``, 由 ``server.ws`` 订阅后广播给全部前端.

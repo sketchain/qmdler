@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """取链与落盘.
 
 **本项目一律走明文播放链路, 这是有意为之.**

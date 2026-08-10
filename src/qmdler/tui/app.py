@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Textual 应用.
 
 纯客户端: 全部动作走 REST, 状态走 WebSocket, 与 WebUI 连的是同一个后端.

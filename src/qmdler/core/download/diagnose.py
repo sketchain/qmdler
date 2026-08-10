@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """``--single`` 诊断模式的记录结构.
 
 把四层校验每一层的**实际判定值**摊开, 而不是只给一个 success/trial 结论 ——

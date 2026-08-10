@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // WebSocket 客户端：自动重连 + 心跳。
 // 服务端在连上时先推一帧全量快照，再补最近的历史事件，最后才是增量。
 

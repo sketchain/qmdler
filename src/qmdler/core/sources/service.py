@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """歌单来源.
 
 八种来源统一产出 ``list[SongEntry]``.

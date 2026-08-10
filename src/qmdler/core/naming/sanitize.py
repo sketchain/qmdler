@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """文件名清洗.
 
 统一按 **Windows 最严格标准** 执行, Linux/macOS 也一样 —— 否则用同步盘把库

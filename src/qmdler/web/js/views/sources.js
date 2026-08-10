@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 歌单来源：八种来源分标签页。
 
 import { api } from '../api.js';

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """日志脱敏.
 
 凭证、``musickey``、``vkey``、完整 ``purl`` 绝不能出现在日志里 —— 日志会被

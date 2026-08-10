@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 // 设置：音质链、间隔、模板（含实时预览）、歌词、封面、tag、保存位置、预设。
 
 import { api } from '../api.js';

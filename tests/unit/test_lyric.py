@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """QRC → LRC 转换."""
 
 from __future__ import annotations

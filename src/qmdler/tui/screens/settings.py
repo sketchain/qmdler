@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """设置界面: 音质优先级链 (上下键排序)、间隔、模板预览、保存目录."""
 
 from __future__ import annotations
